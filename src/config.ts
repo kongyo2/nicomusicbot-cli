@@ -79,8 +79,7 @@ function buildCandidate(draft: ConfigDraft): BotConfig {
 function resolveDefaultConfigPath(): string {
   if (process.platform === "win32") {
     const appData =
-      process.env.APPDATA ??
-      path.join(os.homedir(), "AppData", "Roaming");
+      process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming");
 
     return path.join(appData, "nicomusicbot", "config.json");
   }
@@ -91,7 +90,9 @@ function resolveDefaultConfigPath(): string {
   return path.join(xdgConfigHome, "nicomusicbot", "config.json");
 }
 
-export function parseCliOptions(argv: string[] = process.argv.slice(2)): CliOptions {
+export function parseCliOptions(
+  argv: string[] = process.argv.slice(2),
+): CliOptions {
   const { values } = parseArgs({
     args: argv,
     options: {
@@ -201,8 +202,7 @@ export async function loadInitialDraft(
     prefix: merged.prefix ?? "!",
     niconicoUser: merged.niconicoUser ?? "",
     niconicoPassword: merged.niconicoPassword ?? "",
-    saveConfig:
-      options.saveConfigOverride ?? persisted.loaded,
+    saveConfig: options.saveConfigOverride ?? persisted.loaded,
     configPath: options.configPath,
   };
 

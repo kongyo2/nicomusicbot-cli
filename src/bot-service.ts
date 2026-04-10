@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
+import { createRequire } from "node:module";
 import {
   AudioPlayerStatus,
   DiscordGatewayAdapterCreator,
@@ -37,6 +38,7 @@ import { RuntimeStore } from "./runtime-store.js";
 import type {
   BotConfig,
   DependencyCheck,
+  DependencySetupResult,
   GuildPlaybackStatus,
   GuildSnapshot,
   LogLevel,
@@ -44,6 +46,7 @@ import type {
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
+const require = createRequire(import.meta.url);
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
@@ -78,7 +81,11 @@ async function sendWithRetry(
       await channel.send(payload);
       return;
     } catch (error) {
-      if (error instanceof DiscordAPIError && error.status === 429 && attempt < 3) {
+      if (
+        error instanceof DiscordAPIError &&
+        error.status === 429 &&
+        attempt < 3
+      ) {
         await sleep(10_000 * 2 ** attempt);
         continue;
       }
@@ -99,11 +106,223 @@ async function commandExists(command: string): Promise<boolean> {
   }
 }
 
+function moduleExists(moduleName: string): boolean {
+  try {
+    require.resolve(moduleName);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runSetupCommand(
+  command: string,
+  args: string[],
+): Promise<{ ok: boolean; output: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync(command, args, {
+      maxBuffer: 1024 * 1024,
+      env: process.env,
+    });
+
+    return {
+      ok: true,
+      output: `${stdout}${stderr}`.trim(),
+    };
+  } catch (error) {
+    if (error instanceof Error && "stdout" in error && "stderr" in error) {
+      const withOutput = error as Error & { stdout?: string; stderr?: string };
+      return {
+        ok: false,
+        output: `${withOutput.stdout ?? ""}${withOutput.stderr ?? ""}`.trim(),
+      };
+    }
+
+    return {
+      ok: false,
+      output: formatError(error),
+    };
+  }
+}
+
+async function setupLinuxDependencies(
+  missingCommands: Set<string>,
+): Promise<DependencySetupResult> {
+  const logs: string[] = [];
+  let changed = false;
+
+  const hasApt = await commandExists("apt-get");
+
+  if (!hasApt) {
+    logs.push("apt-get was not found. Skipped Linux auto-setup.");
+    return { attempted: false, changed: false, logs };
+  }
+
+  const installTargets: string[] = [];
+
+  if (missingCommands.has("ffmpeg")) {
+    installTargets.push("ffmpeg");
+  }
+
+  if (missingCommands.has("yt-dlp")) {
+    installTargets.push("yt-dlp", "python3-pip");
+  }
+
+  if (installTargets.length > 0) {
+    const update = await runSetupCommand("apt-get", ["update"]);
+
+    if (!update.ok) {
+      logs.push(`apt-get update failed: ${update.output || "no output"}`);
+      return { attempted: true, changed: false, logs };
+    }
+
+    const install = await runSetupCommand("apt-get", [
+      "install",
+      "-y",
+      ...Array.from(new Set(installTargets)),
+    ]);
+
+    logs.push(
+      install.ok
+        ? "Installed packages through apt-get."
+        : `apt-get install failed: ${install.output || "no output"}`,
+    );
+    changed = changed || install.ok;
+  }
+
+  if (missingCommands.has("yt-dlp")) {
+    const pipInstall = await runSetupCommand("python3", [
+      "-m",
+      "pip",
+      "install",
+      "-U",
+      "yt-dlp",
+      "--break-system-packages",
+    ]);
+
+    logs.push(
+      pipInstall.ok
+        ? "Updated yt-dlp through python3 -m pip."
+        : `pip yt-dlp install failed: ${pipInstall.output || "no output"}`,
+    );
+    changed = changed || pipInstall.ok;
+  }
+
+  return { attempted: true, changed, logs };
+}
+
+export async function autoSetupPrerequisites(
+  checks: DependencyCheck[],
+): Promise<DependencySetupResult> {
+  const missingCommands = new Set(
+    checks
+      .filter((check) => !check.ok && check.required)
+      .map((check) => check.command),
+  );
+
+  if (missingCommands.size === 0) {
+    return { attempted: false, changed: false, logs: [] };
+  }
+
+  if (process.platform === "linux") {
+    return setupLinuxDependencies(missingCommands);
+  }
+
+  if (process.platform === "darwin") {
+    const hasBrew = await commandExists("brew");
+
+    if (!hasBrew) {
+      return {
+        attempted: false,
+        changed: false,
+        logs: ["Homebrew was not found. Skipped macOS auto-setup."],
+      };
+    }
+
+    const targets = Array.from(missingCommands);
+    const install = await runSetupCommand("brew", ["install", ...targets]);
+
+    return {
+      attempted: true,
+      changed: install.ok,
+      logs: [
+        install.ok
+          ? `Installed dependencies with Homebrew: ${targets.join(", ")}`
+          : `brew install failed: ${install.output || "no output"}`,
+      ],
+    };
+  }
+
+  if (process.platform === "win32") {
+    const hasWinget = await commandExists("winget");
+
+    if (!hasWinget) {
+      return {
+        attempted: false,
+        changed: false,
+        logs: ["winget was not found. Skipped Windows auto-setup."],
+      };
+    }
+
+    const logs: string[] = [];
+    let changed = false;
+
+    if (missingCommands.has("ffmpeg")) {
+      const ffmpeg = await runSetupCommand("winget", [
+        "install",
+        "-e",
+        "--id",
+        "Gyan.FFmpeg",
+      ]);
+
+      logs.push(
+        ffmpeg.ok
+          ? "Installed ffmpeg via winget."
+          : `winget ffmpeg install failed: ${ffmpeg.output || "no output"}`,
+      );
+      changed = changed || ffmpeg.ok;
+    }
+
+    if (missingCommands.has("yt-dlp")) {
+      const ytdlp = await runSetupCommand("winget", [
+        "install",
+        "-e",
+        "--id",
+        "yt-dlp.yt-dlp",
+      ]);
+
+      logs.push(
+        ytdlp.ok
+          ? "Installed yt-dlp via winget."
+          : `winget yt-dlp install failed: ${ytdlp.output || "no output"}`,
+      );
+      changed = changed || ytdlp.ok;
+    }
+
+    return {
+      attempted: true,
+      changed,
+      logs,
+    };
+  }
+
+  return {
+    attempted: false,
+    changed: false,
+    logs: ["Auto-setup is not implemented for this operating system."],
+  };
+}
+
 export async function checkPrerequisites(): Promise<DependencyCheck[]> {
   const checks = await Promise.all([
     commandExists("yt-dlp"),
     commandExists("ffmpeg"),
   ]);
+
+  const hasOpusBackend =
+    moduleExists("@discordjs/opus") ||
+    moduleExists("node-opus") ||
+    moduleExists("opusscript");
 
   return [
     {
@@ -111,12 +330,23 @@ export async function checkPrerequisites(): Promise<DependencyCheck[]> {
       command: "yt-dlp",
       ok: checks[0],
       details: checks[0] ? "Found in PATH." : "Not found in PATH.",
+      required: true,
     },
     {
       name: "ffmpeg",
       command: "ffmpeg",
       ok: checks[1],
       details: checks[1] ? "Found in PATH." : "Not found in PATH.",
+      required: true,
+    },
+    {
+      name: "opus backend",
+      command: "@discordjs/opus | node-opus | opusscript",
+      ok: hasOpusBackend,
+      details: hasOpusBackend
+        ? "At least one Opus backend is available."
+        : "No Opus backend found. Install opusscript or @discordjs/opus.",
+      required: false,
     },
   ];
 }
@@ -175,7 +405,10 @@ class GuildController {
     return this.player.state.status !== AudioPlayerStatus.Idle;
   }
 
-  async connect(member: GuildMember, channel: GuildTextBasedChannel): Promise<void> {
+  async connect(
+    member: GuildMember,
+    channel: GuildTextBasedChannel,
+  ): Promise<void> {
     const voiceChannel = member.voice.channel;
 
     if (!voiceChannel) {
@@ -192,8 +425,8 @@ class GuildController {
         const connection = joinVoiceChannel({
           channelId: voiceChannel.id,
           guildId: member.guild.id,
-          adapterCreator:
-            member.guild.voiceAdapterCreator as DiscordGatewayAdapterCreator,
+          adapterCreator: member.guild
+            .voiceAdapterCreator as DiscordGatewayAdapterCreator,
           selfDeaf: false,
         });
 
@@ -201,9 +434,10 @@ class GuildController {
         this.connection.subscribe(this.player);
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
 
-        this.playbackStatus = this.player.state.status === AudioPlayerStatus.Idle
-          ? "idle"
-          : "playing";
+        this.playbackStatus =
+          this.player.state.status === AudioPlayerStatus.Idle
+            ? "idle"
+            : "playing";
         this.lastError = undefined;
         this.updateSnapshot();
         return;
@@ -226,7 +460,9 @@ class GuildController {
         if (attempt === 3) {
           this.playbackStatus = "error";
           this.updateSnapshot();
-          throw new Error("Failed to connect to the voice channel.");
+          throw new Error("Failed to connect to the voice channel.", {
+            cause: error,
+          });
         }
 
         await sleep(2_000);
@@ -319,7 +555,9 @@ class GuildController {
 
     if (this.current) {
       const currentUrl = makeTrackUrl(this.current);
-      lines.push(`Now playing: ${this.current.title ?? this.current.id ?? "Unknown"}`);
+      lines.push(
+        `Now playing: ${this.current.title ?? this.current.id ?? "Unknown"}`,
+      );
 
       if (currentUrl) {
         lines.push(currentUrl);
@@ -356,7 +594,9 @@ class GuildController {
 
   updateSnapshot(): void {
     const textChannelName =
-      this.textChannel && "name" in this.textChannel ? this.textChannel.name : undefined;
+      this.textChannel && "name" in this.textChannel
+        ? this.textChannel.name
+        : undefined;
     const voiceChannel = this.resolveVoiceChannel();
     const snapshot: GuildSnapshot = {
       guildId: this.guild.id,
@@ -399,7 +639,9 @@ class GuildController {
     if (this.player.state.status !== AudioPlayerStatus.Idle) {
       this.ignoreNextIdle = true;
       this.player.stop(true);
-      await entersState(this.player, AudioPlayerStatus.Idle, 5_000).catch(() => undefined);
+      await entersState(this.player, AudioPlayerStatus.Idle, 5_000).catch(
+        () => undefined,
+      );
     }
 
     this.cleanupProcesses();
@@ -497,7 +739,10 @@ class GuildController {
         this.connection.subscribe(this.player);
         this.player.play(resource);
         this.updateSnapshot();
-        this.service.log("success", `[${this.guild.name}] Now playing ${title}`);
+        this.service.log(
+          "success",
+          `[${this.guild.name}] Now playing ${title}`,
+        );
         await this.notify(`Now playing: ${title}\n${url}`);
         return;
       } catch (error) {
@@ -781,7 +1026,10 @@ export class NicomusicBotService {
     controller.enqueueEntries(entries, message.member.displayName);
 
     if (entries.length > 1) {
-      await sendWithRetry(channel, `Added ${entries.length} tracks to the queue.`);
+      await sendWithRetry(
+        channel,
+        `Added ${entries.length} tracks to the queue.`,
+      );
     }
 
     await controller.playIfIdle();
@@ -793,7 +1041,10 @@ export class NicomusicBotService {
     rest: string,
   ): Promise<void> {
     if (!rest) {
-      await sendWithRetry(channel, `Usage: ${this.config.prefix}tag <tag|url> [limit]`);
+      await sendWithRetry(
+        channel,
+        `Usage: ${this.config.prefix}tag <tag|url> [limit]`,
+      );
       return;
     }
 
@@ -811,7 +1062,10 @@ export class NicomusicBotService {
 
     const controller = this.getOrCreateGuildController(message.guild!);
     await controller.connect(message.member, channel);
-    await sendWithRetry(channel, `Searching NicoNico tag "${tag}" (limit ${limit})...`);
+    await sendWithRetry(
+      channel,
+      `Searching NicoNico tag "${tag}" (limit ${limit})...`,
+    );
     const entries = await searchByTag(tag, limit);
 
     if (entries.length === 0) {
@@ -820,7 +1074,10 @@ export class NicomusicBotService {
     }
 
     controller.enqueueEntries(entries, message.member.displayName);
-    await sendWithRetry(channel, `Added ${entries.length} tracks from tag "${tag}".`);
+    await sendWithRetry(
+      channel,
+      `Added ${entries.length} tracks from tag "${tag}".`,
+    );
     await controller.playIfIdle();
   }
 
@@ -872,7 +1129,10 @@ export class NicomusicBotService {
 
     await controller.destroy();
     this.guildControllers.delete(message.guild!.id);
-    await sendWithRetry(channel, "Stopped playback and left the voice channel.");
+    await sendWithRetry(
+      channel,
+      "Stopped playback and left the voice channel.",
+    );
   }
 
   private async handleVolumeCommand(
@@ -891,11 +1151,15 @@ export class NicomusicBotService {
     const parsed = Number.parseInt(rest, 10);
 
     if (Number.isNaN(parsed) || parsed < 0 || parsed > 300) {
-      await sendWithRetry(channel, "Volume must be a number between 0 and 300.");
+      await sendWithRetry(
+        channel,
+        "Volume must be a number between 0 and 300.",
+      );
       return;
     }
 
-    const activeController = controller ?? this.getOrCreateGuildController(message.guild!);
+    const activeController =
+      controller ?? this.getOrCreateGuildController(message.guild!);
     const applied = await activeController.setVolume(parsed);
     await sendWithRetry(channel, `Volume set to ${applied}%.`);
   }
@@ -914,7 +1178,10 @@ export class NicomusicBotService {
       return;
     }
 
-    await sendWithRetry(channel, `Unmuted. Restored volume to ${currentVolume}%.`);
+    await sendWithRetry(
+      channel,
+      `Unmuted. Restored volume to ${currentVolume}%.`,
+    );
   }
 
   private async handleVoiceStateUpdate(
@@ -945,7 +1212,10 @@ export class NicomusicBotService {
       return;
     }
 
-    this.log("info", `[${newState.guild.name}] Left voice channel because it became empty.`);
+    this.log(
+      "info",
+      `[${newState.guild.name}] Left voice channel because it became empty.`,
+    );
     await controller.destroy();
     this.guildControllers.delete(newState.guild.id);
   }
@@ -966,7 +1236,10 @@ export class NicomusicBotService {
         }
 
         const waitTime = 60_000 * attempt;
-        this.log("warn", `Discord API rate-limited the login probe, waiting ${waitTime / 1000}s.`);
+        this.log(
+          "warn",
+          `Discord API rate-limited the login probe, waiting ${waitTime / 1000}s.`,
+        );
         await sleep(waitTime);
       } catch (error) {
         this.log("warn", `Discord API probe failed: ${formatError(error)}`);

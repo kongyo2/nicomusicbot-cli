@@ -73,7 +73,9 @@ export class RuntimeStore {
 
   upsertGuild(snapshot: GuildSnapshot): void {
     const guilds = [...this.state.guilds];
-    const index = guilds.findIndex((guild) => guild.guildId === snapshot.guildId);
+    const index = guilds.findIndex(
+      (guild) => guild.guildId === snapshot.guildId,
+    );
 
     if (index === -1) {
       guilds.push(snapshot);

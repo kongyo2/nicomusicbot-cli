@@ -25,7 +25,11 @@ import {
   saveConfigToDisk,
   validateDraft,
 } from "./config.js";
-import { NicomusicBotService, checkPrerequisites } from "./bot-service.js";
+import {
+  NicomusicBotService,
+  autoSetupPrerequisites,
+  checkPrerequisites,
+} from "./bot-service.js";
 import { RuntimeStore } from "./runtime-store.js";
 import type {
   ConfigDraft,
@@ -128,7 +132,10 @@ function createInitialAppState({
   autoStart,
   initialDraft,
   initialValidationIssues,
-}: Pick<AppProps, "autoStart" | "initialDraft" | "initialValidationIssues">): AppState {
+}: Pick<
+  AppProps,
+  "autoStart" | "initialDraft" | "initialValidationIssues"
+>): AppState {
   return {
     draft: initialDraft,
     validationIssues: initialValidationIssues,
@@ -277,8 +284,9 @@ export function App({
     }
 
     return (
-      runtimeState.guilds.find((guild) => guild.guildId === state.selectedGuildId) ??
-      runtimeState.guilds[0]
+      runtimeState.guilds.find(
+        (guild) => guild.guildId === state.selectedGuildId,
+      ) ?? runtimeState.guilds[0]
     );
   }, [runtimeState, state.selectedGuildId]);
 
@@ -338,9 +346,32 @@ export function App({
         label: "Checking external dependencies",
         value: 20,
       });
-      nextStore.addLog("info", "Checking yt-dlp and ffmpeg...");
+      nextStore.addLog("info", "Checking yt-dlp, ffmpeg, and Opus backend...");
 
-      const checks = await checkPrerequisites();
+      let checks = await checkPrerequisites();
+
+      const missingRequired = checks.filter(
+        (check) => check.required && !check.ok,
+      );
+
+      if (missingRequired.length > 0) {
+        nextStore.addLog(
+          "warn",
+          `Missing required dependencies detected: ${missingRequired
+            .map((check) => check.command)
+            .join(", ")}. Trying automatic setup...`,
+        );
+
+        const setup = await autoSetupPrerequisites(checks);
+
+        for (const setupLog of setup.logs) {
+          nextStore.addLog(setup.changed ? "success" : "warn", setupLog);
+        }
+
+        if (setup.attempted) {
+          checks = await checkPrerequisites();
+        }
+      }
 
       if (cancelled) {
         return;
@@ -352,7 +383,18 @@ export function App({
       });
       nextStore.setDependencies(checks);
 
-      const missing = checks.filter((check) => !check.ok);
+      const missing = checks.filter((check) => !check.ok && check.required);
+
+      const optionalMissing = checks.filter(
+        (check) => !check.ok && !check.required,
+      );
+
+      for (const optional of optionalMissing) {
+        nextStore.addLog(
+          "warn",
+          `Optional dependency missing: ${optional.details}`,
+        );
+      }
 
       if (missing.length > 0) {
         const message = `Missing dependencies: ${missing
@@ -680,7 +722,9 @@ function NiconicoUserScreen({
     <Box flexDirection="column" gap={1}>
       <Header {...headerProps} />
       <Text bold>NicoNico username or email</Text>
-      <Text dimColor>Leave empty to run without NicoNico account credentials.</Text>
+      <Text dimColor>
+        Leave empty to run without NicoNico account credentials.
+      </Text>
       <TextInput
         placeholder="Optional"
         defaultValue={draft.niconicoUser}
@@ -868,13 +912,15 @@ function RunningScreen({
         <Badge color={statusBadgeColor(runtimeState.status)}>
           {runtimeState.status.toUpperCase()}
         </Badge>
-        <Badge color="blue">{runtimeState.connectedUser ?? "Connecting..."}</Badge>
+        <Badge color="blue">
+          {runtimeState.connectedUser ?? "Connecting..."}
+        </Badge>
         <Badge color="yellow">Prefix {draft.prefix}</Badge>
       </Box>
       <StatusMessage variant={runtimeVariant(runtimeState.status)}>
-        Ready for `{draft.prefix}play`, `{draft.prefix}tag`, `{draft.prefix}skip`,
-        `{draft.prefix}queue`, `{draft.prefix}stop`, `{draft.prefix}volume`,
-        `{draft.prefix}mute`. Press `q` to quit.
+        Ready for `{draft.prefix}play`, `{draft.prefix}tag`, `{draft.prefix}
+        skip`, `{draft.prefix}queue`, `{draft.prefix}stop`, `{draft.prefix}
+        volume`, `{draft.prefix}mute`. Press `q` to quit.
       </StatusMessage>
       <Box gap={3}>
         <Box flexDirection="column" width={36} gap={1}>
@@ -908,13 +954,17 @@ function RunningScreen({
               </Box>
               <UnorderedList>
                 <UnorderedList.Item>
-                  <Text>Current: {selectedGuild.currentTitle ?? "Nothing playing"}</Text>
+                  <Text>
+                    Current: {selectedGuild.currentTitle ?? "Nothing playing"}
+                  </Text>
                 </UnorderedList.Item>
                 <UnorderedList.Item>
                   <Text>Queue length: {selectedGuild.queueLength}</Text>
                 </UnorderedList.Item>
                 <UnorderedList.Item>
-                  <Text>Requested by: {selectedGuild.requestedBy ?? "Unknown"}</Text>
+                  <Text>
+                    Requested by: {selectedGuild.requestedBy ?? "Unknown"}
+                  </Text>
                 </UnorderedList.Item>
                 <UnorderedList.Item>
                   <Text>
@@ -983,14 +1033,17 @@ function OverviewScreen({
       <ConfigSummary draft={draft} />
       <OrderedList>
         <OrderedList.Item>
-          <Text>Invite the bot to a server with message and voice permissions.</Text>
+          <Text>
+            Invite the bot to a server with message and voice permissions.
+          </Text>
         </OrderedList.Item>
         <OrderedList.Item>
           <Text>Join a voice channel in Discord.</Text>
         </OrderedList.Item>
         <OrderedList.Item>
           <Text>
-            Run {`"${draft.prefix}play <nico url>"`} or {`"${draft.prefix}tag <tag> [limit]"`}.
+            Run {`"${draft.prefix}play <nico url>"`} or{" "}
+            {`"${draft.prefix}tag <tag> [limit]"`}.
           </Text>
         </OrderedList.Item>
       </OrderedList>

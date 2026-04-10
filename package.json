@@ -16,7 +16,12 @@
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "dev": "tsx src/cli.tsx",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "lint": "oxlint --silent src",
+    "lint:strict": "oxlint --deny-warnings src",
+    "check:file": "prettier --check",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "keywords": [
     "discord",
@@ -31,12 +36,15 @@
     "@inkjs/ui": "^2.0.0",
     "discord.js": "^14.26.2",
     "ink": "^7.0.0",
+    "opusscript": "^0.0.8",
     "react": "^19.2.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {
     "@types/node": "^24.7.2",
     "@types/react": "^19.2.2",
+    "oxlint": "^1.59.0",
+    "prettier": "^3.8.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   },
