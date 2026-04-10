@@ -37,14 +37,8 @@ function bindProcessErrorGuards(): void {
       return;
     }
 
-    const writeResult = safeWrite(process.stderr, `${normalized.message}\n`);
-
-    if (writeResult.isErr()) {
-      process.exitCode = 1;
-      return;
-    }
-
-    process.exitCode = 1;
+    safeWrite(process.stderr, `${normalized.message}\n`);
+    process.exit(1);
   };
 
   process.stdout.on("error", swallowEpipe);
@@ -79,6 +73,6 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   const message = normalizeError(error).message;
-  const result = safeWrite(process.stderr, `${message}\n`);
-  process.exitCode = result.isErr() ? 1 : 0;
+  safeWrite(process.stderr, `${message}\n`);
+  process.exitCode = 1;
 });

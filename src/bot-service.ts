@@ -1,7 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createRequire } from "node:module";
-import { fromPromise } from "neverthrow";
 import {
   AudioPlayerStatus,
   DiscordGatewayAdapterCreator,
@@ -79,16 +78,7 @@ async function sendWithRetry(
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
-      const sendResult = await fromPromise(
-        channel.send(payload),
-        (error) =>
-          error instanceof Error ? error : new Error(String(error)),
-      );
-
-      if (sendResult.isErr()) {
-        throw sendResult.error;
-      }
-
+      await channel.send(payload);
       return;
     } catch (error) {
       if (
