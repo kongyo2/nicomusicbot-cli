@@ -904,6 +904,17 @@ function RunningScreen({
   const selectedGuild =
     runtimeState.guilds.find((guild) => guild.guildId === selectedGuildId) ??
     runtimeState.guilds[0];
+  const commandHelp = [
+    `${draft.prefix}play`,
+    `${draft.prefix}tag`,
+    `${draft.prefix}skip`,
+    `${draft.prefix}queue`,
+    `${draft.prefix}stop`,
+    `${draft.prefix}volume`,
+    `${draft.prefix}mute`,
+  ]
+    .map((command) => `\`${command}\``)
+    .join(", ");
 
   return (
     <Box flexDirection="column" gap={1}>
@@ -918,9 +929,7 @@ function RunningScreen({
         <Badge color="yellow">Prefix {draft.prefix}</Badge>
       </Box>
       <StatusMessage variant={runtimeVariant(runtimeState.status)}>
-        Ready for `{draft.prefix}play`, `{draft.prefix}tag`, `{draft.prefix}
-        skip`, `{draft.prefix}queue`, `{draft.prefix}stop`, `{draft.prefix}
-        volume`, `{draft.prefix}mute`. Press `q` to quit.
+        {`Ready for ${commandHelp}. Press \`q\` to quit.`}
       </StatusMessage>
       <Box gap={3}>
         <Box flexDirection="column" width={36} gap={1}>

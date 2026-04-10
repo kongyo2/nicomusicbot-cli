@@ -121,7 +121,7 @@ async function runSetupCommand(
 ): Promise<{ ok: boolean; output: string }> {
   try {
     const { stdout, stderr } = await execFileAsync(command, args, {
-      maxBuffer: 1024 * 1024,
+      maxBuffer: 10 * 1024 * 1024,
       env: process.env,
     });
 
@@ -173,21 +173,20 @@ async function setupLinuxDependencies(
 
     if (!update.ok) {
       logs.push(`apt-get update failed: ${update.output || "no output"}`);
-      return { attempted: true, changed: false, logs };
+    } else {
+      const install = await runSetupCommand("apt-get", [
+        "install",
+        "-y",
+        ...Array.from(new Set(installTargets)),
+      ]);
+
+      logs.push(
+        install.ok
+          ? "Installed packages through apt-get."
+          : `apt-get install failed: ${install.output || "no output"}`,
+      );
+      changed = changed || install.ok;
     }
-
-    const install = await runSetupCommand("apt-get", [
-      "install",
-      "-y",
-      ...Array.from(new Set(installTargets)),
-    ]);
-
-    logs.push(
-      install.ok
-        ? "Installed packages through apt-get."
-        : `apt-get install failed: ${install.output || "no output"}`,
-    );
-    changed = changed || install.ok;
   }
 
   if (missingCommands.has("yt-dlp")) {
@@ -273,6 +272,8 @@ export async function autoSetupPrerequisites(
         "-e",
         "--id",
         "Gyan.FFmpeg",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
       ]);
 
       logs.push(
@@ -289,6 +290,8 @@ export async function autoSetupPrerequisites(
         "-e",
         "--id",
         "yt-dlp.yt-dlp",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
       ]);
 
       logs.push(
