@@ -726,6 +726,29 @@ class GuildController {
         this.ytDlpProcess = ytDlp;
         this.ffmpegProcess = ffmpeg;
 
+        ytDlp.on("error", (error) => {
+          this.service.log(
+            "error",
+            `[${this.guild.name}] yt-dlp process error: ${error.message}`,
+          );
+        });
+        ffmpeg.on("error", (error) => {
+          this.service.log(
+            "error",
+            `[${this.guild.name}] ffmpeg process error: ${error.message}`,
+          );
+        });
+        ffmpeg.stdin.on("error", (error) => {
+          if ("code" in error && error.code === "EPIPE") {
+            return;
+          }
+
+          this.service.log(
+            "warn",
+            `[${this.guild.name}] ffmpeg stdin error: ${error.message}`,
+          );
+        });
+
         const resource = createAudioResource(ffmpeg.stdout, {
           inputType: StreamType.Raw,
           inlineVolume: true,
