@@ -15,6 +15,13 @@ export type DependencyCheck = {
   command: string;
   ok: boolean;
   details: string;
+  required: boolean;
+};
+
+export type DependencySetupResult = {
+  attempted: boolean;
+  changed: boolean;
+  logs: string[];
 };
 
 export type ProgressState = {

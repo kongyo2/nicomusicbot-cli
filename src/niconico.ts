@@ -22,7 +22,12 @@ const VIDEO_ID_PREFIXES = [
 
 function authArgs(auth: NicoAuth): string[] {
   if (auth.niconicoUser && auth.niconicoPassword) {
-    return ["--username", auth.niconicoUser, "--password", auth.niconicoPassword];
+    return [
+      "--username",
+      auth.niconicoUser,
+      "--password",
+      auth.niconicoPassword,
+    ];
   }
 
   return [];
@@ -124,9 +129,7 @@ export function makeTrackUrl(entry: TrackEntry): string | undefined {
   return normalizeNiconicoUrl(value);
 }
 
-async function runYtDlpJson(
-  args: string[],
-): Promise<TrackEntry[]> {
+async function runYtDlpJson(args: string[]): Promise<TrackEntry[]> {
   const result = await runCommand("yt-dlp", args);
 
   return result.stdout
@@ -158,12 +161,7 @@ export async function fetchEntries(
   url: string,
   auth: NicoAuth,
 ): Promise<TrackEntry[]> {
-  const baseArgs = [
-    "--dump-json",
-    "-q",
-    "--ignore-errors",
-    ...authArgs(auth),
-  ];
+  const baseArgs = ["--dump-json", "-q", "--ignore-errors", ...authArgs(auth)];
   let entries = await runYtDlpJson([
     ...baseArgs,
     "--flat-playlist",
@@ -171,10 +169,7 @@ export async function fetchEntries(
   ]);
 
   if (entries.length === 0) {
-    entries = await runYtDlpJson([
-      ...baseArgs,
-      normalizeNiconicoUrl(url),
-    ]);
+    entries = await runYtDlpJson([...baseArgs, normalizeNiconicoUrl(url)]);
   }
 
   return entries;
