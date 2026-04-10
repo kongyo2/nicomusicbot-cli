@@ -192,11 +192,7 @@ export async function fetchEntries(
     normalizeNiconicoUrl(url),
   ]);
 
-  if (entriesResult.isErr()) {
-    throw entriesResult.error;
-  }
-
-  if (entriesResult.value.length === 0) {
+  if (entriesResult.isErr() || entriesResult.value.length === 0) {
     entriesResult = await runYtDlpJson([...baseArgs, normalizeNiconicoUrl(url)]);
   }
 
