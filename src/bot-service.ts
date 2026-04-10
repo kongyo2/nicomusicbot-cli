@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createRequire } from "node:module";
+import { fromPromise } from "neverthrow";
 import {
   AudioPlayerStatus,
   DiscordGatewayAdapterCreator,
@@ -78,7 +79,16 @@ async function sendWithRetry(
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
-      await channel.send(payload);
+      const sendResult = await fromPromise(
+        channel.send(payload),
+        (error) =>
+          error instanceof Error ? error : new Error(String(error)),
+      );
+
+      if (sendResult.isErr()) {
+        throw sendResult.error;
+      }
+
       return;
     } catch (error) {
       if (
@@ -725,6 +735,29 @@ class GuildController {
 
         this.ytDlpProcess = ytDlp;
         this.ffmpegProcess = ffmpeg;
+
+        ytDlp.on("error", (error) => {
+          this.service.log(
+            "error",
+            `[${this.guild.name}] yt-dlp process error: ${error.message}`,
+          );
+        });
+        ffmpeg.on("error", (error) => {
+          this.service.log(
+            "error",
+            `[${this.guild.name}] ffmpeg process error: ${error.message}`,
+          );
+        });
+        ffmpeg.stdin.on("error", (error) => {
+          if ("code" in error && error.code === "EPIPE") {
+            return;
+          }
+
+          this.service.log(
+            "warn",
+            `[${this.guild.name}] ffmpeg stdin error: ${error.message}`,
+          );
+        });
 
         const resource = createAudioResource(ffmpeg.stdout, {
           inputType: StreamType.Raw,

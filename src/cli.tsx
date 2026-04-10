@@ -2,14 +2,63 @@
 
 import React from "react";
 import { render } from "ink";
+import { err, ok, type Result } from "neverthrow";
 import { App } from "./app.js";
 import { getHelpText, loadInitialDraft, parseCliOptions } from "./config.js";
 
+function normalizeError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function safeWrite(
+  stream: NodeJS.WriteStream,
+  message: string,
+): Result<void, Error> {
+  try {
+    stream.write(message);
+    return ok(undefined);
+  } catch (error) {
+    const normalized = normalizeError(error);
+
+    if ("code" in normalized && normalized.code === "EPIPE") {
+      return ok(undefined);
+    }
+
+    return err(normalized);
+  }
+}
+
+function bindProcessErrorGuards(): void {
+  const swallowEpipe = (error: unknown) => {
+    const normalized = normalizeError(error);
+
+    if ("code" in normalized && normalized.code === "EPIPE") {
+      process.exitCode = 0;
+      return;
+    }
+
+    const writeResult = safeWrite(process.stderr, `${normalized.message}\n`);
+
+    if (writeResult.isErr()) {
+      process.exitCode = 1;
+      return;
+    }
+
+    process.exitCode = 1;
+  };
+
+  process.stdout.on("error", swallowEpipe);
+  process.stderr.on("error", swallowEpipe);
+  process.on("uncaughtException", swallowEpipe);
+  process.on("unhandledRejection", swallowEpipe);
+}
+
 async function main(): Promise<void> {
+  bindProcessErrorGuards();
   const options = parseCliOptions();
 
   if (options.help) {
-    process.stdout.write(`${getHelpText()}\n`);
+    safeWrite(process.stdout, `${getHelpText()}\n`);
     return;
   }
 
@@ -29,7 +78,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+  const message = normalizeError(error).message;
+  const result = safeWrite(process.stderr, `${message}\n`);
+  process.exitCode = result.isErr() ? 1 : 0;
 });

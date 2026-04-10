@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { err, fromPromise, ok, type Result } from "neverthrow";
 import type { TrackEntry } from "./types.js";
 
 type NicoAuth = {
@@ -36,8 +37,13 @@ function authArgs(auth: NicoAuth): string[] {
 async function runCommand(
   command: string,
   args: string[],
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return new Promise((resolve, reject) => {
+): Promise<
+  Result<
+    { stdout: string; stderr: string; exitCode: number },
+    Error
+  >
+> {
+  return new Promise((resolve) => {
     const child = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -53,13 +59,17 @@ async function runCommand(
     child.stderr?.on("data", (chunk) => {
       stderr += chunk;
     });
-    child.on("error", reject);
+    child.on("error", (error) => {
+      resolve(err(new Error(`Failed to spawn "${command}": ${error.message}`)));
+    });
     child.on("close", (exitCode) => {
-      resolve({
-        stdout,
-        stderr,
-        exitCode: exitCode ?? -1,
-      });
+      resolve(
+        ok({
+          stdout,
+          stderr,
+          exitCode: exitCode ?? -1,
+        }),
+      );
     });
   });
 }
@@ -129,10 +139,22 @@ export function makeTrackUrl(entry: TrackEntry): string | undefined {
   return normalizeNiconicoUrl(value);
 }
 
-async function runYtDlpJson(args: string[]): Promise<TrackEntry[]> {
+async function runYtDlpJson(args: string[]): Promise<Result<TrackEntry[], Error>> {
   const result = await runCommand("yt-dlp", args);
 
-  return result.stdout
+  if (result.isErr()) {
+    return err(result.error);
+  }
+
+  if (result.value.exitCode !== 0 && !result.value.stdout.trim()) {
+    return err(
+      new Error(
+        `yt-dlp exited with code ${result.value.exitCode}: ${result.value.stderr.trim() || "no stderr output"}`,
+      ),
+    );
+  }
+
+  const entries = result.value.stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
@@ -155,6 +177,8 @@ async function runYtDlpJson(args: string[]): Promise<TrackEntry[]> {
         return [];
       }
     });
+
+  return ok(entries);
 }
 
 export async function fetchEntries(
@@ -162,17 +186,25 @@ export async function fetchEntries(
   auth: NicoAuth,
 ): Promise<TrackEntry[]> {
   const baseArgs = ["--dump-json", "-q", "--ignore-errors", ...authArgs(auth)];
-  let entries = await runYtDlpJson([
+  let entriesResult = await runYtDlpJson([
     ...baseArgs,
     "--flat-playlist",
     normalizeNiconicoUrl(url),
   ]);
 
-  if (entries.length === 0) {
-    entries = await runYtDlpJson([...baseArgs, normalizeNiconicoUrl(url)]);
+  if (entriesResult.isErr()) {
+    throw entriesResult.error;
   }
 
-  return entries;
+  if (entriesResult.value.length === 0) {
+    entriesResult = await runYtDlpJson([...baseArgs, normalizeNiconicoUrl(url)]);
+  }
+
+  if (entriesResult.isErr()) {
+    throw entriesResult.error;
+  }
+
+  return entriesResult.value;
 }
 
 export async function resolveTrackTitle(
@@ -189,7 +221,7 @@ export async function resolveTrackTitle(
     return entry.title;
   }
 
-  const metadata = await runYtDlpJson([
+  const metadataResult = await runYtDlpJson([
     "--dump-json",
     "-q",
     "--no-playlist",
@@ -197,7 +229,11 @@ export async function resolveTrackTitle(
     url,
   ]);
 
-  return metadata[0]?.title ?? entry.title;
+  if (metadataResult.isErr()) {
+    return entry.title;
+  }
+
+  return metadataResult.value[0]?.title ?? entry.title;
 }
 
 function extractTagFromInput(input: string): string {
@@ -253,17 +289,41 @@ export async function searchByTag(
     _context: "NicomusicBotCLI",
   }).toString();
 
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "NicomusicBotCLI/0.1.0",
-    },
-  });
+  const responseResult = await fromPromise(
+    fetch(url, {
+      headers: {
+        "User-Agent": "NicomusicBotCLI/0.1.0",
+      },
+    }),
+    (error) =>
+      new Error(
+        `Tag search request failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+  );
 
-  if (!response.ok) {
-    return [];
+  if (responseResult.isErr()) {
+    throw responseResult.error;
   }
 
-  const data = (await response.json()) as {
+  const response = responseResult.value;
+
+  if (!response.ok) {
+    throw new Error(`Tag search API returned ${response.status}.`);
+  }
+
+  const jsonResult = await fromPromise(
+    response.json(),
+    (error) =>
+      new Error(
+        `Failed to decode tag search response: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+  );
+
+  if (jsonResult.isErr()) {
+    throw jsonResult.error;
+  }
+
+  const data = jsonResult.value as {
     data?: Array<{
       contentId?: string;
       title?: string;

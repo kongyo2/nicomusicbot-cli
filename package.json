@@ -15,6 +15,7 @@
   },
   "scripts": {
     "build": "tsc --project tsconfig.json",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
     "dev": "tsx src/cli.tsx",
     "start": "node dist/cli.js",
     "lint": "oxlint --silent src",
@@ -36,6 +37,7 @@
     "@inkjs/ui": "^2.0.0",
     "discord.js": "^14.26.2",
     "ink": "^7.0.0",
+    "neverthrow": "^8.2.0",
     "opusscript": "^0.0.8",
     "react": "^19.2.0",
     "zod": "^4.1.12"
