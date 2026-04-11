@@ -1,5 +1,9 @@
 # NicomusicBot
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kongyo2/nicomusicbot-cli)
+[![npm version](https://img.shields.io/npm/v/%40kongyo2%2Fnicomusicbot)](https://www.npmjs.com/package/@kongyo2/nicomusicbot)
+[![CI](https://github.com/kongyo2/nicomusicbot-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/kongyo2/nicomusicbot-cli/actions/workflows/ci.yml)
+
 [`NicomusicBot`](https://github.com/abeshinzo78/NicomusicBot) を元にしたTypeScript 移植版です。
 Discordのボイスチャンネルでニコニコ動画の音声を再生するためのbotです。
 
