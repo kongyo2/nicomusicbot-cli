@@ -38,10 +38,7 @@ async function runCommand(
   command: string,
   args: string[],
 ): Promise<
-  Result<
-    { stdout: string; stderr: string; exitCode: number },
-    Error
-  >
+  Result<{ stdout: string; stderr: string; exitCode: number }, Error>
 > {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
@@ -139,7 +136,9 @@ export function makeTrackUrl(entry: TrackEntry): string | undefined {
   return normalizeNiconicoUrl(value);
 }
 
-async function runYtDlpJson(args: string[]): Promise<Result<TrackEntry[], Error>> {
+async function runYtDlpJson(
+  args: string[],
+): Promise<Result<TrackEntry[], Error>> {
   const result = await runCommand("yt-dlp", args);
 
   if (result.isErr()) {
@@ -193,7 +192,10 @@ export async function fetchEntries(
   ]);
 
   if (entriesResult.isErr() || entriesResult.value.length === 0) {
-    entriesResult = await runYtDlpJson([...baseArgs, normalizeNiconicoUrl(url)]);
+    entriesResult = await runYtDlpJson([
+      ...baseArgs,
+      normalizeNiconicoUrl(url),
+    ]);
   }
 
   if (entriesResult.isErr()) {
