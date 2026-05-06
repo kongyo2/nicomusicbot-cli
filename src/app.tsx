@@ -1068,6 +1068,7 @@ function Header({ draft, loadedFromFile, warnings }: HeaderProps) {
       <Box gap={1}>
         <Text bold>NicomusicBot</Text>
         <Badge color="blue">@kongyo2/nicomusicbot</Badge>
+        <Badge color="blue">profile {draft.profile}</Badge>
         <Badge color={loadedFromFile ? "green" : "yellow"}>
           {loadedFromFile ? "config loaded" : "session setup"}
         </Badge>
@@ -1085,6 +1086,9 @@ function Header({ draft, loadedFromFile, warnings }: HeaderProps) {
 function ConfigSummary({ draft }: { draft: ConfigDraft }) {
   return (
     <UnorderedList>
+      <UnorderedList.Item>
+        <Text>Profile: {draft.profile}</Text>
+      </UnorderedList.Item>
       <UnorderedList.Item>
         <Text>Discord token: {maskSecret(draft.token)}</Text>
       </UnorderedList.Item>

@@ -60,6 +60,7 @@ export type LogEntry = {
 };
 
 export type ConfigDraft = {
+  profile: string;
   token: string;
   prefix: string;
   niconicoUser: string;
@@ -69,6 +70,7 @@ export type ConfigDraft = {
 };
 
 export type BotConfig = {
+  profile: string;
   token: string;
   prefix: string;
   niconicoUser?: string;

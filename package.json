@@ -16,6 +16,8 @@
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "typecheck": "tsc --project tsconfig.json --noEmit",
+    "test": "vitest --run",
+    "test:coverage": "vitest --run --coverage",
     "dev": "tsx src/cli.tsx",
     "start": "node dist/cli.js",
     "lint": "oxlint --silent src",
@@ -45,10 +47,12 @@
   "devDependencies": {
     "@types/node": "^24.7.2",
     "@types/react": "^19.2.2",
+    "@vitest/coverage-v8": "^4.1.5",
     "oxlint": "^1.59.0",
     "prettier": "^3.8.2",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.5"
   },
   "repository": {
     "type": "git",

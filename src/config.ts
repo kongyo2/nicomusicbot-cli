@@ -12,9 +12,10 @@ type PersistedConfig = {
   niconicoPassword?: string;
 };
 
-type CliOptions = {
+export type CliOptions = {
   help: boolean;
   autoStart: boolean;
+  profile: string;
   configPath: string;
   saveConfigOverride?: boolean;
   savePreferenceLocked: boolean;
@@ -35,6 +36,8 @@ const persistedConfigSchema = z.object({
   niconicoPassword: z.string().optional(),
 });
 
+const defaultProfile = "default";
+
 const botConfigSchema = z
   .object({
     token: z.string().trim().min(1, "Discord token is required."),
@@ -45,6 +48,7 @@ const botConfigSchema = z
       .max(10, "Command prefix must be 10 characters or fewer."),
     niconicoUser: z.string().trim().optional(),
     niconicoPassword: z.string().optional(),
+    profile: z.string().trim().min(1, "Profile name is required."),
     configPath: z.string().min(1),
   })
   .superRefine((value, ctx) => {
@@ -66,8 +70,47 @@ function normalizeOptional(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function normalizeProfileName(value: string | undefined): string {
+  const profile = value?.trim() || defaultProfile;
+
+  if (profile === "." || profile === "..") {
+    throw new TypeError("Profile name cannot be a relative path segment.");
+  }
+
+  if (/[\\/]/.test(profile)) {
+    throw new TypeError("Profile name cannot contain path separators.");
+  }
+
+  for (const character of profile) {
+    const code = character.charCodeAt(0);
+
+    if (code < 32 || code === 127) {
+      throw new TypeError("Profile name cannot contain control characters.");
+    }
+  }
+
+  if (profile.length > 64) {
+    throw new TypeError("Profile name must be 64 characters or fewer.");
+  }
+
+  return profile;
+}
+
+function profileFileName(profile: string): string {
+  return `${encodeURIComponent(profile)}.json`;
+}
+
+function withoutUndefined<T extends Record<string, unknown>>(
+  value: T,
+): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => entry !== undefined),
+  ) as Partial<T>;
+}
+
 function buildCandidate(draft: ConfigDraft): BotConfig {
   return {
+    profile: draft.profile,
     token: draft.token,
     prefix: draft.prefix,
     niconicoUser: normalizeOptional(draft.niconicoUser),
@@ -76,18 +119,23 @@ function buildCandidate(draft: ConfigDraft): BotConfig {
   };
 }
 
-function resolveDefaultConfigPath(): string {
+function resolveDefaultConfigPath(profile: string): string {
+  const configFile =
+    profile === defaultProfile
+      ? "config.json"
+      : path.join("profiles", profileFileName(profile));
+
   if (process.platform === "win32") {
     const appData =
       process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming");
 
-    return path.join(appData, "nicomusicbot", "config.json");
+    return path.join(appData, "nicomusicbot", configFile);
   }
 
   const xdgConfigHome =
     process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config");
 
-  return path.join(xdgConfigHome, "nicomusicbot", "config.json");
+  return path.join(xdgConfigHome, "nicomusicbot", configFile);
 }
 
 export function parseCliOptions(
@@ -99,6 +147,7 @@ export function parseCliOptions(
       help: { type: "boolean", short: "h" },
       token: { type: "string" },
       prefix: { type: "string" },
+      profile: { type: "string" },
       config: { type: "string" },
       "skip-menu": { type: "boolean" },
       "save-config": { type: "boolean" },
@@ -109,9 +158,12 @@ export function parseCliOptions(
     allowPositionals: false,
   });
 
+  const profile = normalizeProfileName(
+    values.profile ?? process.env.NICOMUSICBOT_PROFILE,
+  );
   const configPath = values.config
     ? path.resolve(values.config)
-    : resolveDefaultConfigPath();
+    : resolveDefaultConfigPath(profile);
   const saveConfigOverride = values["save-config"]
     ? true
     : values["no-save-config"]
@@ -121,6 +173,7 @@ export function parseCliOptions(
   return {
     help: Boolean(values.help),
     autoStart: Boolean(values["skip-menu"]),
+    profile,
     configPath,
     saveConfigOverride,
     savePreferenceLocked: saveConfigOverride !== undefined,
@@ -193,11 +246,12 @@ export async function loadInitialDraft(
   const merged = {
     prefix: "!",
     ...persisted.config,
-    ...loadEnvironmentConfig(),
-    ...options.overrides,
+    ...withoutUndefined(loadEnvironmentConfig()),
+    ...withoutUndefined(options.overrides),
   };
 
   const draft: ConfigDraft = {
+    profile: options.profile,
     token: merged.token ?? "",
     prefix: merged.prefix ?? "!",
     niconicoUser: merged.niconicoUser ?? "",
@@ -258,7 +312,7 @@ export function maskSecret(value: string): string {
 }
 
 export function getHelpText(): string {
-  const defaultConfigPath = resolveDefaultConfigPath();
+  const defaultConfigPath = resolveDefaultConfigPath(defaultProfile);
 
   return [
     "NicomusicBot",
@@ -269,6 +323,7 @@ export function getHelpText(): string {
     "Options:",
     "  --token <token>                Discord bot token",
     "  --prefix <prefix>              Command prefix (default: !)",
+    "  --profile <name>               Config profile name (default: default)",
     "  --niconico-user <value>        NicoNico login username/email",
     "  --niconico-password <value>    NicoNico login password",
     "  --config <path>                Config file path",

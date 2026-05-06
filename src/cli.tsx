@@ -5,6 +5,8 @@ import { render } from "ink";
 import { err, ok, type Result } from "neverthrow";
 import { App } from "./app.js";
 import { getHelpText, loadInitialDraft, parseCliOptions } from "./config.js";
+import { runHeadless } from "./headless.js";
+import { shouldUseHeadlessMode } from "./terminal.js";
 
 function normalizeError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -53,6 +55,11 @@ async function main(): Promise<void> {
 
   if (options.help) {
     safeWrite(process.stdout, `${getHelpText()}\n`);
+    return;
+  }
+
+  if (shouldUseHeadlessMode(process.stdin, process.stdout)) {
+    process.exitCode = await runHeadless(options);
     return;
   }
 

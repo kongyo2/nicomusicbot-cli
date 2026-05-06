@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { err, fromPromise, ok, type Result } from "neverthrow";
+import { withRetry, type RetryOptions } from "./retry.js";
 import type { TrackEntry } from "./types.js";
 
 type NicoAuth = {
@@ -20,6 +21,26 @@ const VIDEO_ID_PREFIXES = [
   "zb",
   "z9",
 ] as const;
+
+class RetriableHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly retryAfterMs?: number,
+  ) {
+    super(`Tag search API returned ${status}.`);
+  }
+}
+
+class YtDlpCommandError extends Error {
+  constructor(
+    readonly exitCode: number,
+    readonly stderr: string,
+  ) {
+    super(
+      `yt-dlp exited with code ${exitCode}: ${stderr || "no stderr output"}`,
+    );
+  }
+}
 
 function authArgs(auth: NicoAuth): string[] {
   if (auth.niconicoUser && auth.niconicoPassword) {
@@ -139,7 +160,34 @@ export function makeTrackUrl(entry: TrackEntry): string | undefined {
 async function runYtDlpJson(
   args: string[],
 ): Promise<Result<TrackEntry[], Error>> {
-  const result = await runCommand("yt-dlp", args);
+  const result = await fromPromise(
+    withRetry(
+      async () => {
+        const commandResult = await runCommand("yt-dlp", args);
+
+        if (commandResult.isErr()) {
+          throw commandResult.error;
+        }
+
+        if (
+          commandResult.value.exitCode !== 0 &&
+          !commandResult.value.stdout.trim()
+        ) {
+          throw new YtDlpCommandError(
+            commandResult.value.exitCode,
+            commandResult.value.stderr.trim(),
+          );
+        }
+
+        return commandResult.value;
+      },
+      {
+        attempts: 3,
+        shouldRetry: isTransientYtDlpError,
+      },
+    ),
+    (error) => (error instanceof Error ? error : new Error(String(error))),
+  );
 
   if (result.isErr()) {
     return err(result.error);
@@ -147,9 +195,7 @@ async function runYtDlpJson(
 
   if (result.value.exitCode !== 0 && !result.value.stdout.trim()) {
     return err(
-      new Error(
-        `yt-dlp exited with code ${result.value.exitCode}: ${result.value.stderr.trim() || "no stderr output"}`,
-      ),
+      new YtDlpCommandError(result.value.exitCode, result.value.stderr.trim()),
     );
   }
 
@@ -178,6 +224,118 @@ async function runYtDlpJson(
     });
 
   return ok(entries);
+}
+
+function parseRetryAfterMs(response: Response): number | undefined {
+  const retryAfter = response.headers.get("retry-after");
+
+  if (!retryAfter) {
+    return undefined;
+  }
+
+  const seconds = Number.parseFloat(retryAfter);
+
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, seconds * 1_000);
+  }
+
+  const date = Date.parse(retryAfter);
+
+  if (Number.isNaN(date)) {
+    return undefined;
+  }
+
+  return Math.max(0, date - Date.now());
+}
+
+function isTransientHttpStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function isTransientFetchError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+
+  return (
+    error instanceof TypeError ||
+    [
+      "fetch failed",
+      "network",
+      "timeout",
+      "timed out",
+      "connection reset",
+      "econnreset",
+      "etimedout",
+      "eai_again",
+    ].some((needle) => message.includes(needle))
+  );
+}
+
+function isTransientYtDlpError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message =
+    error instanceof YtDlpCommandError
+      ? error.stderr.toLowerCase()
+      : error.message.toLowerCase();
+
+  if (message.includes("enoent") || message.includes("eacces")) {
+    return false;
+  }
+
+  return [
+    "http error 408",
+    "http error 429",
+    "http error 5",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "econnreset",
+    "etimedout",
+    "eai_again",
+  ].some((needle) => message.includes(needle));
+}
+
+async function fetchTagSearchResponse(
+  url: URL,
+  retryOptions: RetryOptions,
+): Promise<Response> {
+  return withRetry(
+    async () => {
+      const response = await fetch(url, {
+        headers: {
+          "User-Agent": "NicomusicBotCLI/0.1.0",
+        },
+      });
+
+      if (isTransientHttpStatus(response.status)) {
+        throw new RetriableHttpError(
+          response.status,
+          parseRetryAfterMs(response),
+        );
+      }
+
+      return response;
+    },
+    {
+      attempts: 3,
+      ...retryOptions,
+      shouldRetry:
+        retryOptions.shouldRetry ??
+        ((error) =>
+          error instanceof RetriableHttpError || isTransientFetchError(error)),
+      getDelayMs:
+        retryOptions.getDelayMs ??
+        ((error) =>
+          error instanceof RetriableHttpError ? error.retryAfterMs : undefined),
+    },
+  );
 }
 
 export async function fetchEntries(
@@ -272,6 +430,7 @@ export function parseTagRequest(raw: string): { tag: string; limit: number } {
 export async function searchByTag(
   tagInput: string,
   limit: number,
+  retryOptions: RetryOptions = {},
 ): Promise<TrackEntry[]> {
   const tag = extractTagFromInput(tagInput);
   const url = new URL(
@@ -288,11 +447,7 @@ export async function searchByTag(
   }).toString();
 
   const responseResult = await fromPromise(
-    fetch(url, {
-      headers: {
-        "User-Agent": "NicomusicBotCLI/0.1.0",
-      },
-    }),
+    fetchTagSearchResponse(url, retryOptions),
     (error) =>
       new Error(
         `Tag search request failed: ${error instanceof Error ? error.message : String(error)}`,
