@@ -830,16 +830,24 @@ function NiconicoSessionScreen({
       <Text dimColor>
         Paste the `user_session` cookie value from a logged-in browser. This is
         the most reliable login (it survives 2FA) and helps avoid mid-playback
-        stops on restricted videos. Leave empty to skip.
+        stops on restricted videos.
+        {draft.niconicoSession
+          ? ' Press Enter to keep it, or type "-" to remove it.'
+          : " Leave empty to skip."}
       </Text>
       <PasswordInput
         placeholder={
           draft.niconicoSession
-            ? "Press Enter to keep the current session cookie"
+            ? 'Enter to keep, "-" to remove'
             : "Optional: user_session_..."
         }
         onSubmit={(value) => {
-          const nextSession = value.trim() || draft.niconicoSession;
+          const trimmed = value.trim();
+          // "-" explicitly clears a saved cookie (e.g. to switch back to
+          // username/password); empty input keeps the existing value so the
+          // edit flow does not silently wipe it.
+          const nextSession =
+            trimmed === "-" ? "" : trimmed || draft.niconicoSession;
 
           handlers.goToPostEditStage({
             ...draft,

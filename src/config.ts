@@ -55,6 +55,12 @@ const botConfigSchema = z
     configPath: z.string().min(1),
   })
   .superRefine((value, ctx) => {
+    // A session cookie is the preferred auth and takes precedence at runtime,
+    // so a stale/partial username/password pair should not block startup.
+    if (value.niconicoSession) {
+      return;
+    }
+
     const hasUser = Boolean(value.niconicoUser);
     const hasPassword = Boolean(value.niconicoPassword);
 

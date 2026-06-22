@@ -177,6 +177,21 @@ describe("config", () => {
     expect(result.validationIssues).toEqual([]);
   });
 
+  it("lets a session cookie bypass the paired username/password check", () => {
+    expect(
+      validateDraft({
+        profile: "default",
+        token: "token",
+        prefix: "!",
+        niconicoUser: "stale-user",
+        niconicoPassword: "",
+        niconicoSession: "user_session_1_abc",
+        saveConfig: false,
+        configPath: "/tmp/config.json",
+      }),
+    ).toEqual([]);
+  });
+
   it("validates required fields and paired NicoNico credentials", () => {
     expect(
       validateDraft({

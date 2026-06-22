@@ -382,8 +382,8 @@ class GuildController {
   private playbackStatus: GuildPlaybackStatus = "idle";
   private lastError?: string;
   private sequence = Promise.resolve();
-  private lastVoiceChannelId?: string;
   private recovering = false;
+  private defunct = false;
 
   constructor(
     private readonly service: NicomusicBotService,
@@ -396,6 +396,10 @@ class GuildController {
     });
 
     this.player.on("error", (error) => {
+      if (this.defunct) {
+        return;
+      }
+
       this.lastError = error.message;
       this.playbackStatus = "error";
       this.updateSnapshot();
@@ -430,7 +434,6 @@ class GuildController {
     }
 
     this.textChannel = channel;
-    this.lastVoiceChannelId = voiceChannel.id;
     this.playbackStatus = "connecting";
     this.lastError = undefined;
     this.updateSnapshot();
@@ -501,100 +504,65 @@ class GuildController {
   private async handleDisconnected(
     connection: ReturnType<typeof joinVoiceChannel>,
   ): Promise<void> {
-    // Ignore disconnect events from a connection we have already replaced.
-    if (this.connection !== connection || this.recovering) {
+    // Ignore disconnects from a connection we already replaced, or once the
+    // controller has been stopped/torn down.
+    if (this.connection !== connection || this.recovering || this.defunct) {
       return;
     }
 
+    this.recovering = true;
+
     try {
       // Discord routinely migrates the voice server, which surfaces as a brief
-      // disconnect followed by an automatic re-handshake. Give the connection a
-      // chance to resume on its own; the player stays subscribed so audio
-      // continues once it returns to Ready.
+      // disconnect followed by an automatic re-handshake (Signalling/Connecting).
+      // Give the connection a chance to resume on its own; the player stays
+      // subscribed so audio continues once it returns to Ready.
       await Promise.race([
         entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
       return;
     } catch {
-      // Not an automatic migration — fall through to a manual rejoin so a
-      // transient network drop does not permanently stop playback.
-    }
-
-    this.recovering = true;
-
-    try {
-      const rejoined = await this.rejoinAndResubscribe();
-
-      if (rejoined) {
-        return;
-      }
-
-      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
-        connection.destroy();
-      }
-
-      this.connection = undefined;
-      this.cleanupProcesses();
-      this.current = undefined;
-      this.playbackStatus = "error";
-      this.lastError = "Voice connection dropped and could not be restored.";
-      this.updateSnapshot();
-      this.service.log(
-        "error",
-        `[${this.guild.name}] Lost the voice connection; stopped playback.`,
-      );
+      // The connection did not re-handshake, so this is an intentional or
+      // unrecoverable disconnect (e.g. a moderator removed the bot). Do NOT
+      // fight it with a rejoin loop — tear down cleanly instead.
     } finally {
       this.recovering = false;
     }
+
+    // A stop()/destroy() (or a replacement connection) may have run while we
+    // were waiting; only tear down if this is still the active connection.
+    if (this.connection !== connection || this.defunct) {
+      return;
+    }
+
+    this.service.log(
+      "warn",
+      `[${this.guild.name}] Voice connection closed; stopping playback.`,
+    );
+    this.teardownAfterDisconnect(connection);
   }
 
-  private async rejoinAndResubscribe(): Promise<boolean> {
-    const channelId = this.lastVoiceChannelId;
+  private teardownAfterDisconnect(
+    connection: ReturnType<typeof joinVoiceChannel>,
+  ): void {
+    this.defunct = true;
 
-    if (!channelId) {
-      return false;
+    if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      connection.destroy();
     }
 
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      let connection: ReturnType<typeof joinVoiceChannel> | undefined;
-
-      try {
-        connection = joinVoiceChannel({
-          channelId,
-          guildId: this.guild.id,
-          adapterCreator: this.guild
-            .voiceAdapterCreator as DiscordGatewayAdapterCreator,
-          selfDeaf: false,
-        });
-
-        this.attachConnectionRecovery(connection);
-        this.connection = connection;
-        connection.subscribe(this.player);
-        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-        this.service.log(
-          "success",
-          `[${this.guild.name}] Reconnected to the voice channel after a drop.`,
-        );
-        return true;
-      } catch (error) {
-        this.service.log(
-          "warn",
-          `[${this.guild.name}] Voice reconnect attempt ${attempt}/3 failed: ${formatError(error)}`,
-        );
-
-        if (
-          connection &&
-          connection.state.status !== VoiceConnectionStatus.Destroyed
-        ) {
-          connection.destroy();
-        }
-
-        await sleep(2_000);
-      }
+    if (this.connection === connection) {
+      this.connection = undefined;
     }
 
-    return false;
+    this.ignoreNextIdle = true;
+    this.player.stop(true);
+    this.cleanupProcesses();
+    this.queue = [];
+    this.current = undefined;
+    this.playbackStatus = "idle";
+    this.service.removeGuildController(this.guild.id);
   }
 
   enqueueEntries(entries: TrackEntry[], requestedBy?: string): void {
@@ -628,6 +596,10 @@ class GuildController {
   }
 
   async destroy(): Promise<void> {
+    // Mark defunct synchronously so an in-flight disconnect handler cancels its
+    // pending recovery instead of rejoining after an explicit stop.
+    this.defunct = true;
+
     await this.serialize(async () => {
       this.queue = [];
       await this.stopForManualTransition();
@@ -752,6 +724,10 @@ class GuildController {
   private async handlePlayerIdle(): Promise<void> {
     if (this.ignoreNextIdle) {
       this.ignoreNextIdle = false;
+      return;
+    }
+
+    if (this.defunct) {
       return;
     }
 
@@ -1188,6 +1164,15 @@ export class NicomusicBotService {
     }
 
     return controller;
+  }
+
+  /**
+   * Drop a controller that tore itself down (e.g. after the bot was removed
+   * from the voice channel) so a later command rebuilds a fresh one.
+   */
+  removeGuildController(guildId: string): void {
+    this.guildControllers.delete(guildId);
+    this.store.removeGuild(guildId);
   }
 
   private async handleMessage(message: Message): Promise<void> {
