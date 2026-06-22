@@ -65,6 +65,7 @@ export type ConfigDraft = {
   prefix: string;
   niconicoUser: string;
   niconicoPassword: string;
+  niconicoSession: string;
   saveConfig: boolean;
   configPath: string;
 };
@@ -75,6 +76,7 @@ export type BotConfig = {
   prefix: string;
   niconicoUser?: string;
   niconicoPassword?: string;
+  niconicoSession?: string;
   configPath: string;
 };
 

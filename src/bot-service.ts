@@ -1,6 +1,9 @@
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
 import {
   AudioPlayerStatus,
   DiscordGatewayAdapterCreator,
@@ -27,6 +30,7 @@ import {
 import type { ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import {
+  buildNiconicoCookieFile,
   fetchEntries,
   makeTrackUrl,
   normalizeNiconicoUrl,
@@ -357,7 +361,12 @@ export async function checkPrerequisites(): Promise<DependencyCheck[]> {
 class GuildController {
   private readonly player = createAudioPlayer({
     behaviors: {
-      noSubscriber: NoSubscriberBehavior.Pause,
+      // Keep decoding through brief subscriber gaps (e.g. a voice server
+      // migration) instead of pausing, which previously stalled playback
+      // mid-track. An empty channel is handled separately by destroying the
+      // connection, so this never plays into the void for long.
+      noSubscriber: NoSubscriberBehavior.Play,
+      maxMissedFrames: 250,
     },
   });
 
@@ -373,6 +382,8 @@ class GuildController {
   private playbackStatus: GuildPlaybackStatus = "idle";
   private lastError?: string;
   private sequence = Promise.resolve();
+  private lastVoiceChannelId?: string;
+  private recovering = false;
 
   constructor(
     private readonly service: NicomusicBotService,
@@ -419,6 +430,7 @@ class GuildController {
     }
 
     this.textChannel = channel;
+    this.lastVoiceChannelId = voiceChannel.id;
     this.playbackStatus = "connecting";
     this.lastError = undefined;
     this.updateSnapshot();
@@ -434,6 +446,7 @@ class GuildController {
         });
 
         this.connection = connection;
+        this.attachConnectionRecovery(connection);
         this.connection.subscribe(this.player);
         await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
 
@@ -471,6 +484,117 @@ class GuildController {
         await sleep(2_000);
       }
     }
+  }
+
+  private attachConnectionRecovery(
+    connection: ReturnType<typeof joinVoiceChannel>,
+  ): void {
+    // joinVoiceChannel can reuse the per-guild connection, so clear any handler
+    // we previously attached before adding a fresh one to avoid stacking
+    // listeners across reconnects.
+    connection.removeAllListeners(VoiceConnectionStatus.Disconnected);
+    connection.on(VoiceConnectionStatus.Disconnected, () => {
+      void this.handleDisconnected(connection);
+    });
+  }
+
+  private async handleDisconnected(
+    connection: ReturnType<typeof joinVoiceChannel>,
+  ): Promise<void> {
+    // Ignore disconnect events from a connection we have already replaced.
+    if (this.connection !== connection || this.recovering) {
+      return;
+    }
+
+    try {
+      // Discord routinely migrates the voice server, which surfaces as a brief
+      // disconnect followed by an automatic re-handshake. Give the connection a
+      // chance to resume on its own; the player stays subscribed so audio
+      // continues once it returns to Ready.
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+      return;
+    } catch {
+      // Not an automatic migration — fall through to a manual rejoin so a
+      // transient network drop does not permanently stop playback.
+    }
+
+    this.recovering = true;
+
+    try {
+      const rejoined = await this.rejoinAndResubscribe();
+
+      if (rejoined) {
+        return;
+      }
+
+      if (connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        connection.destroy();
+      }
+
+      this.connection = undefined;
+      this.cleanupProcesses();
+      this.current = undefined;
+      this.playbackStatus = "error";
+      this.lastError = "Voice connection dropped and could not be restored.";
+      this.updateSnapshot();
+      this.service.log(
+        "error",
+        `[${this.guild.name}] Lost the voice connection; stopped playback.`,
+      );
+    } finally {
+      this.recovering = false;
+    }
+  }
+
+  private async rejoinAndResubscribe(): Promise<boolean> {
+    const channelId = this.lastVoiceChannelId;
+
+    if (!channelId) {
+      return false;
+    }
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      let connection: ReturnType<typeof joinVoiceChannel> | undefined;
+
+      try {
+        connection = joinVoiceChannel({
+          channelId,
+          guildId: this.guild.id,
+          adapterCreator: this.guild
+            .voiceAdapterCreator as DiscordGatewayAdapterCreator,
+          selfDeaf: false,
+        });
+
+        this.attachConnectionRecovery(connection);
+        this.connection = connection;
+        connection.subscribe(this.player);
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+        this.service.log(
+          "success",
+          `[${this.guild.name}] Reconnected to the voice channel after a drop.`,
+        );
+        return true;
+      } catch (error) {
+        this.service.log(
+          "warn",
+          `[${this.guild.name}] Voice reconnect attempt ${attempt}/3 failed: ${formatError(error)}`,
+        );
+
+        if (
+          connection &&
+          connection.state.status !== VoiceConnectionStatus.Destroyed
+        ) {
+          connection.destroy();
+        }
+
+        await sleep(2_000);
+      }
+    }
+
+    return false;
   }
 
   enqueueEntries(entries: TrackEntry[], requestedBy?: string): void {
@@ -707,7 +831,7 @@ class GuildController {
 
       try {
         const title =
-          (await resolveTrackTitle(next, this.service.config)) ??
+          (await resolveTrackTitle(next, this.service.niconicoAuth())) ??
           next.title ??
           next.id ??
           "Unknown";
@@ -719,8 +843,18 @@ class GuildController {
         }
 
         ytDlp.stdout.pipe(ffmpeg.stdin);
-        ytDlp.on("close", () => {
+        ytDlp.on("close", (code) => {
           ffmpeg.stdin?.end();
+
+          // A non-zero exit while this track is still current means the stream
+          // ended early. Surface it so the truncation is diagnosable instead of
+          // silently looking like a normal end-of-track.
+          if (code && code !== 0 && this.current?.id === next.id) {
+            this.service.log(
+              "warn",
+              `[${this.guild.name}] yt-dlp exited with code ${code} during "${title}"; the stream may have been cut short.`,
+            );
+          }
         });
 
         this.ytDlpProcess = ytDlp;
@@ -799,6 +933,28 @@ class GuildController {
         "-f",
         "bestaudio[abr<=128]/bestaudio",
         "--no-playlist",
+        // NicoNico delivers audio as AES-128 encrypted HLS. A single failed or
+        // timed-out fragment used to abort the whole download, which the bot
+        // observed as playback stopping mid-track. Retry transient failures and
+        // skip (rather than abort on) a fragment that is permanently gone so a
+        // glitch costs at most a few seconds instead of the rest of the song.
+        "--no-abort-on-unavailable-fragments",
+        "--retries",
+        "10",
+        "--fragment-retries",
+        "10",
+        "--file-access-retries",
+        "5",
+        "--retry-sleep",
+        "2",
+        // Without pycryptodomex, yt-dlp delegates the encrypted HLS download to
+        // ffmpeg, whose default has no reconnection. Pass input-side reconnect
+        // flags (the `ffmpeg_i:` prefix places them before `-i`, where they take
+        // effect) so the delegated download reconnects on network errors. These
+        // are ignored when the native downloader is used, so it is safe in both
+        // modes.
+        "--downloader-args",
+        "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 30 -rw_timeout 30000000",
         "-o",
         "-",
         ...this.service.authArgs(),
@@ -850,6 +1006,8 @@ export class NicomusicBotService {
 
   private client?: Client;
   private readonly guildControllers = new Map<string, GuildController>();
+  private cookiesPath?: string;
+  private cookiesDir?: string;
 
   constructor(config: BotConfig, store: RuntimeStore) {
     this.config = config;
@@ -860,7 +1018,28 @@ export class NicomusicBotService {
     this.store.addLog(level, message);
   }
 
+  /**
+   * Auth object passed to the metadata helpers in niconico.ts. Prefers the
+   * `user_session` cookie because password login is unreliable (2FA and the
+   * broken yt-dlp login flow), falling back to username/password.
+   */
+  niconicoAuth(): {
+    niconicoUser?: string;
+    niconicoPassword?: string;
+    cookiesPath?: string;
+  } {
+    return {
+      niconicoUser: this.config.niconicoUser,
+      niconicoPassword: this.config.niconicoPassword,
+      cookiesPath: this.cookiesPath,
+    };
+  }
+
   authArgs(): string[] {
+    if (this.cookiesPath) {
+      return ["--cookies", this.cookiesPath];
+    }
+
     if (this.config.niconicoUser && this.config.niconicoPassword) {
       return [
         "--username",
@@ -871,6 +1050,44 @@ export class NicomusicBotService {
     }
 
     return [];
+  }
+
+  private async ensureCookieFile(): Promise<void> {
+    if (this.cookiesPath || !this.config.niconicoSession) {
+      return;
+    }
+
+    const contents = buildNiconicoCookieFile(this.config.niconicoSession);
+
+    if (!contents) {
+      return;
+    }
+
+    try {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "nicomusicbot-"));
+      const file = path.join(dir, "cookies.txt");
+      await writeFile(file, contents, { mode: 0o600 });
+      this.cookiesDir = dir;
+      this.cookiesPath = file;
+      this.log("info", "Using NicoNico session cookie for authentication.");
+    } catch (error) {
+      this.log(
+        "warn",
+        `Could not prepare the NicoNico cookie file: ${formatError(error)}`,
+      );
+    }
+  }
+
+  private async cleanupCookieFile(): Promise<void> {
+    const dir = this.cookiesDir;
+    this.cookiesPath = undefined;
+    this.cookiesDir = undefined;
+
+    if (!dir) {
+      return;
+    }
+
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 
   async start(): Promise<void> {
@@ -884,6 +1101,7 @@ export class NicomusicBotService {
       value: 60,
     });
     this.log("info", "Preparing Discord client...");
+    await this.ensureCookieFile();
     await this.waitForDiscordApi();
 
     const client = new Client({
@@ -922,6 +1140,7 @@ export class NicomusicBotService {
       this.log("error", `Discord login failed: ${formatError(error)}`);
       client.destroy();
       this.client = undefined;
+      await this.cleanupCookieFile();
       throw error;
     }
   }
@@ -943,6 +1162,7 @@ export class NicomusicBotService {
 
     this.client.destroy();
     this.client = undefined;
+    await this.cleanupCookieFile();
     this.store.clearGuilds();
     this.store.setConnectedUser(undefined);
     this.store.setStatus("stopped");
@@ -1042,7 +1262,10 @@ export class NicomusicBotService {
 
     const controller = this.getOrCreateGuildController(message.guild!);
     await controller.connect(message.member, channel);
-    const entries = await fetchEntries(normalizeNiconicoUrl(rest), this.config);
+    const entries = await fetchEntries(
+      normalizeNiconicoUrl(rest),
+      this.niconicoAuth(),
+    );
 
     if (entries.length === 0) {
       await sendWithRetry(channel, "No tracks were found for that URL.");

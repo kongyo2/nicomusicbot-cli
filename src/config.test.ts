@@ -135,6 +135,48 @@ describe("config", () => {
     });
   });
 
+  it("parses the NicoNico session cookie override", () => {
+    const options = parseCliOptions([
+      "--niconico-session",
+      "user_session_1_abc",
+    ]);
+
+    expect(options.overrides.niconicoSession).toBe("user_session_1_abc");
+  });
+
+  it("reads the NicoNico session cookie from the environment", async () => {
+    const configPath = await tempPath();
+    vi.stubEnv("DISCORD_TOKEN", "env-token");
+    vi.stubEnv("NICONICO_SESSION", "user_session_env_abc");
+
+    const result = await loadInitialDraft(
+      parseCliOptions(["--config", configPath]),
+    );
+
+    expect(result.draft.niconicoSession).toBe("user_session_env_abc");
+    expect(result.validationIssues).toEqual([]);
+  });
+
+  it("round-trips the session cookie through disk without password", async () => {
+    const configPath = await tempPath("nested/config.json");
+    await saveConfigToDisk({
+      token: "token",
+      prefix: "!",
+      niconicoSession: "user_session_disk_abc",
+      profile: "default",
+      configPath,
+    });
+
+    const persisted = JSON.parse(await readFile(configPath, "utf8"));
+    expect(persisted.niconicoSession).toBe("user_session_disk_abc");
+
+    const result = await loadInitialDraft(
+      parseCliOptions(["--config", configPath]),
+    );
+    expect(result.draft.niconicoSession).toBe("user_session_disk_abc");
+    expect(result.validationIssues).toEqual([]);
+  });
+
   it("validates required fields and paired NicoNico credentials", () => {
     expect(
       validateDraft({
