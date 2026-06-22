@@ -44,6 +44,7 @@ type Stage =
   | "prefix"
   | "niconicoUser"
   | "niconicoPassword"
+  | "niconicoSession"
   | "save"
   | "starting"
   | "running"
@@ -554,6 +555,15 @@ export function App({
           handlers={handlers}
         />
       );
+    case "niconicoSession":
+      return (
+        <NiconicoSessionScreen
+          headerProps={headerProps}
+          draft={state.draft}
+          validationIssues={state.validationIssues}
+          handlers={handlers}
+        />
+      );
     case "save":
       return (
         <SaveScreen
@@ -732,11 +742,12 @@ function NiconicoUserScreen({
           const nextUser = value.trim();
 
           if (!nextUser) {
-            handlers.goToPostEditStage({
+            handlers.commitDraft({
               ...draft,
               niconicoUser: "",
               niconicoPassword: "",
             });
+            handlers.goToStage("niconicoSession");
             return;
           }
 
@@ -789,9 +800,58 @@ function NiconicoPasswordScreen({
             return;
           }
 
-          handlers.goToPostEditStage({
+          handlers.commitDraft({
             ...draft,
             niconicoPassword: nextPassword,
+          });
+          handlers.goToStage("niconicoSession");
+        }}
+      />
+      <ValidationMessages issues={validationIssues} />
+    </Box>
+  );
+}
+
+function NiconicoSessionScreen({
+  headerProps,
+  draft,
+  validationIssues,
+  handlers,
+}: {
+  headerProps: HeaderProps;
+  draft: ConfigDraft;
+  validationIssues: string[];
+  handlers: ScreenHandlers;
+}) {
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Header {...headerProps} />
+      <Text bold>NicoNico session cookie</Text>
+      <Text dimColor>
+        Paste the `user_session` cookie value from a logged-in browser. This is
+        the most reliable login (it survives 2FA) and helps avoid mid-playback
+        stops on restricted videos.
+        {draft.niconicoSession
+          ? ' Press Enter to keep it, or type "-" to remove it.'
+          : " Leave empty to skip."}
+      </Text>
+      <PasswordInput
+        placeholder={
+          draft.niconicoSession
+            ? 'Enter to keep, "-" to remove'
+            : "Optional: user_session_..."
+        }
+        onSubmit={(value) => {
+          const trimmed = value.trim();
+          // "-" explicitly clears a saved cookie (e.g. to switch back to
+          // username/password); empty input keeps the existing value so the
+          // edit flow does not silently wipe it.
+          const nextSession =
+            trimmed === "-" ? "" : trimmed || draft.niconicoSession;
+
+          handlers.goToPostEditStage({
+            ...draft,
+            niconicoSession: nextSession,
           });
         }}
       />
@@ -1098,7 +1158,11 @@ function ConfigSummary({ draft }: { draft: ConfigDraft }) {
       <UnorderedList.Item>
         <Text>
           NicoNico auth:{" "}
-          {draft.niconicoUser ? `${draft.niconicoUser} + password` : "disabled"}
+          {draft.niconicoSession
+            ? "session cookie"
+            : draft.niconicoUser
+              ? `${draft.niconicoUser} + password`
+              : "disabled"}
         </Text>
       </UnorderedList.Item>
       <UnorderedList.Item>

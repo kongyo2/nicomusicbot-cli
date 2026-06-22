@@ -35,6 +35,7 @@ npx @kongyo2/nicomusicbot [options]
 - `--prefix <prefix>`: コマンドのプレフィックス (デフォルト: `!`)
 - `--niconico-user <value>`: ニコニコ動画のログインユーザー名/メールアドレス
 - `--niconico-password <value>`: ニコニコ動画のログインパスワード
+- `--niconico-session <value>`: ニコニコ動画の `user_session` クッキー（**推奨**）
 - `--config <path>`: 設定ファイルのパスを指定
 - `--save-config`: セットアップ後に設定を保存する
 - `--no-save-config`: 設定を保存しない
@@ -57,6 +58,20 @@ npx @kongyo2/nicomusicbot --token "YOUR_DISCORD_TOKEN" --skip-menu
 - `NICOMUSICBOT_PREFIX`: コマンドのプレフィックス
 - `NICONICO_USER`: ニコニコ動画のログインユーザー名/メールアドレス
 - `NICONICO_PASSWORD` または `NICONICO_PASS`: ニコニコ動画のログインパスワード
+- `NICONICO_SESSION`: ニコニコ動画の `user_session` クッキー（推奨。下記参照）
+
+## ニコニコのログインについて（推奨: セッションクッキー）
+
+ニコニコのユーザー名/パスワードによるログインは、2段階認証やログインフローの仕様変更により
+失敗することがあります。より確実なのは、ログイン済みブラウザの `user_session` クッキーを使う方法です。
+
+1. ブラウザでニコニコ動画にログインする
+2. 開発者ツール → Application/Storage → Cookies から `user_session` の値をコピーする
+   （`user_session_XXXXXXXX_...` の形式）
+3. `--niconico-session "<値>"` または環境変数 `NICONICO_SESSION` に設定する
+
+セッションクッキーを設定すると、ユーザー名/パスワードより優先して使用されます。
+ログイン済みセッションを使うことで、視聴制限のある動画でも途中で止まりにくくなります。
 
 ## 設定ファイルの保存場所
 

@@ -10,6 +10,7 @@ type PersistedConfig = {
   prefix?: string;
   niconicoUser?: string;
   niconicoPassword?: string;
+  niconicoSession?: string;
 };
 
 export type CliOptions = {
@@ -34,6 +35,7 @@ const persistedConfigSchema = z.object({
   prefix: z.string().optional(),
   niconicoUser: z.string().optional(),
   niconicoPassword: z.string().optional(),
+  niconicoSession: z.string().optional(),
 });
 
 const defaultProfile = "default";
@@ -48,10 +50,17 @@ const botConfigSchema = z
       .max(10, "Command prefix must be 10 characters or fewer."),
     niconicoUser: z.string().trim().optional(),
     niconicoPassword: z.string().optional(),
+    niconicoSession: z.string().trim().optional(),
     profile: z.string().trim().min(1, "Profile name is required."),
     configPath: z.string().min(1),
   })
   .superRefine((value, ctx) => {
+    // A session cookie is the preferred auth and takes precedence at runtime,
+    // so a stale/partial username/password pair should not block startup.
+    if (value.niconicoSession) {
+      return;
+    }
+
     const hasUser = Boolean(value.niconicoUser);
     const hasPassword = Boolean(value.niconicoPassword);
 
@@ -115,6 +124,7 @@ function buildCandidate(draft: ConfigDraft): BotConfig {
     prefix: draft.prefix,
     niconicoUser: normalizeOptional(draft.niconicoUser),
     niconicoPassword: normalizeOptional(draft.niconicoPassword),
+    niconicoSession: normalizeOptional(draft.niconicoSession),
     configPath: draft.configPath,
   };
 }
@@ -154,6 +164,7 @@ export function parseCliOptions(
       "no-save-config": { type: "boolean" },
       "niconico-user": { type: "string" },
       "niconico-password": { type: "string" },
+      "niconico-session": { type: "string" },
     },
     allowPositionals: false,
   });
@@ -182,6 +193,7 @@ export function parseCliOptions(
       prefix: values.prefix,
       niconicoUser: values["niconico-user"],
       niconicoPassword: values["niconico-password"],
+      niconicoSession: values["niconico-session"],
     },
   };
 }
@@ -230,6 +242,8 @@ function loadEnvironmentConfig(): PersistedConfig {
     niconicoUser: process.env.NICONICO_USER,
     niconicoPassword:
       process.env.NICONICO_PASS ?? process.env.NICONICO_PASSWORD,
+    niconicoSession:
+      process.env.NICONICO_SESSION ?? process.env.NICONICO_SESSION_COOKIE,
   };
 }
 
@@ -256,6 +270,7 @@ export async function loadInitialDraft(
     prefix: merged.prefix ?? "!",
     niconicoUser: merged.niconicoUser ?? "",
     niconicoPassword: merged.niconicoPassword ?? "",
+    niconicoSession: merged.niconicoSession ?? "",
     saveConfig: options.saveConfigOverride ?? persisted.loaded,
     configPath: options.configPath,
   };
@@ -290,6 +305,7 @@ export async function saveConfigToDisk(config: BotConfig): Promise<void> {
     prefix: config.prefix,
     niconicoUser: config.niconicoUser,
     niconicoPassword: config.niconicoPassword,
+    niconicoSession: config.niconicoSession,
   };
 
   await writeFile(
@@ -326,6 +342,7 @@ export function getHelpText(): string {
     "  --profile <name>               Config profile name (default: default)",
     "  --niconico-user <value>        NicoNico login username/email",
     "  --niconico-password <value>    NicoNico login password",
+    "  --niconico-session <value>     NicoNico user_session cookie (recommended)",
     "  --config <path>                Config file path",
     "  --save-config                  Save config after setup",
     "  --no-save-config               Do not save config",
