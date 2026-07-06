@@ -5,12 +5,9 @@ import { render } from "ink";
 import { err, ok, type Result } from "neverthrow";
 import { App } from "./app.js";
 import { getHelpText, loadInitialDraft, parseCliOptions } from "./config.js";
+import { normalizeError } from "./errors.js";
 import { runHeadless } from "./headless.js";
 import { shouldUseHeadlessMode } from "./terminal.js";
-
-function normalizeError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
-}
 
 function safeWrite(
   stream: NodeJS.WriteStream,

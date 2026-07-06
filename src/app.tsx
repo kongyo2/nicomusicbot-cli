@@ -632,6 +632,44 @@ export function App({
   }
 }
 
+function Screen({
+  headerProps,
+  children,
+}: {
+  headerProps: HeaderProps;
+  children: React.ReactNode;
+}) {
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Header {...headerProps} />
+      {children}
+    </Box>
+  );
+}
+
+function FieldScreen({
+  headerProps,
+  title,
+  description,
+  validationIssues,
+  children,
+}: {
+  headerProps: HeaderProps;
+  title: string;
+  description: React.ReactNode;
+  validationIssues: string[];
+  children: React.ReactNode;
+}) {
+  return (
+    <Screen headerProps={headerProps}>
+      <Text bold>{title}</Text>
+      <Text dimColor>{description}</Text>
+      {children}
+      <ValidationMessages issues={validationIssues} />
+    </Screen>
+  );
+}
+
 function TokenScreen({
   headerProps,
   draft,
@@ -644,14 +682,16 @@ function TokenScreen({
   handlers: ScreenHandlers;
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
-      <Text bold>Discord bot token</Text>
-      <Text dimColor>
-        {draft.token
+    <FieldScreen
+      headerProps={headerProps}
+      title="Discord bot token"
+      description={
+        draft.token
           ? `Current token: ${maskSecret(draft.token)}`
-          : "No token configured yet."}
-      </Text>
+          : "No token configured yet."
+      }
+      validationIssues={validationIssues}
+    >
       <PasswordInput
         placeholder={
           draft.token
@@ -673,8 +713,7 @@ function TokenScreen({
           handlers.goToStage("prefix");
         }}
       />
-      <ValidationMessages issues={validationIssues} />
-    </Box>
+    </FieldScreen>
   );
 }
 
@@ -690,10 +729,12 @@ function PrefixScreen({
   handlers: ScreenHandlers;
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
-      <Text bold>Command prefix</Text>
-      <Text dimColor>Examples: `!`, `?`, `!!`</Text>
+    <FieldScreen
+      headerProps={headerProps}
+      title="Command prefix"
+      description="Examples: `!`, `?`, `!!`"
+      validationIssues={validationIssues}
+    >
       <TextInput
         placeholder="!"
         defaultValue={draft.prefix}
@@ -712,8 +753,7 @@ function PrefixScreen({
           handlers.goToStage("niconicoUser");
         }}
       />
-      <ValidationMessages issues={validationIssues} />
-    </Box>
+    </FieldScreen>
   );
 }
 
@@ -729,12 +769,12 @@ function NiconicoUserScreen({
   handlers: ScreenHandlers;
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
-      <Text bold>NicoNico username or email</Text>
-      <Text dimColor>
-        Leave empty to run without NicoNico account credentials.
-      </Text>
+    <FieldScreen
+      headerProps={headerProps}
+      title="NicoNico username or email"
+      description="Leave empty to run without NicoNico account credentials."
+      validationIssues={validationIssues}
+    >
       <TextInput
         placeholder="Optional"
         defaultValue={draft.niconicoUser}
@@ -758,8 +798,7 @@ function NiconicoUserScreen({
           handlers.goToStage("niconicoPassword");
         }}
       />
-      <ValidationMessages issues={validationIssues} />
-    </Box>
+    </FieldScreen>
   );
 }
 
@@ -775,14 +814,16 @@ function NiconicoPasswordScreen({
   handlers: ScreenHandlers;
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
-      <Text bold>NicoNico password</Text>
-      <Text dimColor>
-        {draft.niconicoPassword
+    <FieldScreen
+      headerProps={headerProps}
+      title="NicoNico password"
+      description={
+        draft.niconicoPassword
           ? "Press Enter to keep the current password."
-          : "Required only when using a NicoNico account."}
-      </Text>
+          : "Required only when using a NicoNico account."
+      }
+      validationIssues={validationIssues}
+    >
       <PasswordInput
         placeholder={
           draft.niconicoPassword
@@ -807,8 +848,7 @@ function NiconicoPasswordScreen({
           handlers.goToStage("niconicoSession");
         }}
       />
-      <ValidationMessages issues={validationIssues} />
-    </Box>
+    </FieldScreen>
   );
 }
 
@@ -824,17 +864,21 @@ function NiconicoSessionScreen({
   handlers: ScreenHandlers;
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
-      <Text bold>NicoNico session cookie</Text>
-      <Text dimColor>
-        Paste the `user_session` cookie value from a logged-in browser. This is
-        the most reliable login (it survives 2FA) and helps avoid mid-playback
-        stops on restricted videos.
-        {draft.niconicoSession
-          ? ' Press Enter to keep it, or type "-" to remove it.'
-          : " Leave empty to skip."}
-      </Text>
+    <FieldScreen
+      headerProps={headerProps}
+      title="NicoNico session cookie"
+      description={
+        <>
+          Paste the `user_session` cookie value from a logged-in browser. This
+          is the most reliable login (it survives 2FA) and helps avoid
+          mid-playback stops on restricted videos.
+          {draft.niconicoSession
+            ? ' Press Enter to keep it, or type "-" to remove it.'
+            : " Leave empty to skip."}
+        </>
+      }
+      validationIssues={validationIssues}
+    >
       <PasswordInput
         placeholder={
           draft.niconicoSession
@@ -855,8 +899,7 @@ function NiconicoSessionScreen({
           });
         }}
       />
-      <ValidationMessages issues={validationIssues} />
-    </Box>
+    </FieldScreen>
   );
 }
 
@@ -870,8 +913,7 @@ function SaveScreen({
   handlers: ScreenHandlers;
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
+    <Screen headerProps={headerProps}>
       <Text bold>Save config to disk?</Text>
       <Text dimColor>{draft.configPath}</Text>
       <Alert variant="warning" title="Plaintext secrets">
@@ -893,7 +935,7 @@ function SaveScreen({
           handlers.goToStage("overview");
         }}
       />
-    </Box>
+    </Screen>
   );
 }
 
@@ -907,8 +949,7 @@ function StartingScreen({
   dependencyChecks: DependencyCheck[];
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
+    <Screen headerProps={headerProps}>
       <Spinner label={progress?.label ?? "Starting NicomusicBot..."} />
       <Box width={50}>
         <ProgressBar value={progress?.value ?? 0} />
@@ -916,7 +957,7 @@ function StartingScreen({
       {dependencyChecks.length > 0 && (
         <DependencyList dependencyChecks={dependencyChecks} />
       )}
-    </Box>
+    </Screen>
   );
 }
 
@@ -934,8 +975,7 @@ function FailedScreen({
   onEdit: () => void;
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
+    <Screen headerProps={headerProps}>
       <Alert variant="error" title="Startup failed">
         {startupError ?? "Unknown startup error."}
       </Alert>
@@ -944,7 +984,7 @@ function FailedScreen({
       )}
       <Text dimColor>Press `q` to quit, or answer below to continue.</Text>
       <ConfirmInput onConfirm={onRetry} onCancel={onEdit} />
-    </Box>
+    </Screen>
   );
 }
 
@@ -977,8 +1017,7 @@ function RunningScreen({
     .join(", ");
 
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
+    <Screen headerProps={headerProps}>
       <Box gap={1}>
         <Badge color={statusBadgeColor(runtimeState.status)}>
           {runtimeState.status.toUpperCase()}
@@ -1073,7 +1112,7 @@ function RunningScreen({
           </UnorderedList>
         )}
       </Box>
-    </Box>
+    </Screen>
   );
 }
 
@@ -1089,8 +1128,7 @@ function OverviewScreen({
   onEdit: () => void;
 }) {
   return (
-    <Box flexDirection="column" gap={1}>
-      <Header {...headerProps} />
+    <Screen headerProps={headerProps}>
       <StatusMessage variant="info">
         Review the current configuration and choose whether to start or edit it.
       </StatusMessage>
@@ -1118,7 +1156,7 @@ function OverviewScreen({
       </OrderedList>
       <ConfirmInput onConfirm={onStart} onCancel={onEdit} />
       <Text dimColor>Press `q` to quit.</Text>
-    </Box>
+    </Screen>
   );
 }
 

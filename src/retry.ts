@@ -7,7 +7,7 @@ export type RetryOptions = {
   getDelayMs?: (error: unknown, failedAttempt: number) => number | undefined;
 };
 
-function defaultSleep(milliseconds: number): Promise<void> {
+export function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
@@ -32,7 +32,7 @@ export async function withRetry<T>(
   const attempts = Math.max(1, options.attempts ?? 3);
   const baseDelayMs = Math.max(0, options.baseDelayMs ?? 500);
   const maxDelayMs = Math.max(baseDelayMs, options.maxDelayMs ?? 5_000);
-  const sleep = options.sleep ?? defaultSleep;
+  const sleepImpl = options.sleep ?? sleep;
   const shouldRetry = options.shouldRetry ?? defaultShouldRetry;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -43,7 +43,7 @@ export async function withRetry<T>(
         throw error;
       }
 
-      await sleep(
+      await sleepImpl(
         options.getDelayMs?.(error, attempt) ??
           exponentialDelay(attempt, baseDelayMs, maxDelayMs),
       );
