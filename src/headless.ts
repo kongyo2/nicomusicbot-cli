@@ -10,6 +10,7 @@ import {
   saveConfigToDisk,
   type CliOptions,
 } from "./config.js";
+import { normalizeError } from "./errors.js";
 import { RuntimeStore } from "./runtime-store.js";
 import type {
   BotConfig,
@@ -39,10 +40,6 @@ type HeadlessDependencies = {
   createService?: (config: BotConfig, store: RuntimeStore) => HeadlessService;
   waitForShutdown?: (context: ShutdownContext) => Promise<void>;
 };
-
-function normalizeError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
-}
 
 function safeWrite(stream: NodeJS.WriteStream, message: string): void {
   try {

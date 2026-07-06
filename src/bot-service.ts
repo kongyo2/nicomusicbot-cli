@@ -38,6 +38,7 @@ import {
   resolveTrackTitle,
   searchByTag,
 } from "./niconico.js";
+import { sleep } from "./retry.js";
 import { RuntimeStore } from "./runtime-store.js";
 import type {
   BotConfig,
@@ -51,12 +52,6 @@ import type {
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
-
-function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
-}
 
 function formatError(error: unknown): string {
   if (error instanceof Error) {
