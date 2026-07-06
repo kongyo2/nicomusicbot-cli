@@ -9,6 +9,10 @@ import { normalizeError } from "./errors.js";
 import { runHeadless } from "./headless.js";
 import { shouldUseHeadlessMode } from "./terminal.js";
 
+function isEpipeError(error: Error): boolean {
+  return "code" in error && error.code === "EPIPE";
+}
+
 function safeWrite(
   stream: NodeJS.WriteStream,
   message: string,
@@ -19,7 +23,7 @@ function safeWrite(
   } catch (error) {
     const normalized = normalizeError(error);
 
-    if ("code" in normalized && normalized.code === "EPIPE") {
+    if (isEpipeError(normalized)) {
       return ok(undefined);
     }
 
@@ -31,7 +35,7 @@ function bindProcessErrorGuards(): void {
   const swallowEpipe = (error: unknown) => {
     const normalized = normalizeError(error);
 
-    if ("code" in normalized && normalized.code === "EPIPE") {
+    if (isEpipeError(normalized)) {
       process.exitCode = 0;
       return;
     }
