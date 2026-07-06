@@ -296,6 +296,10 @@ function isTransientHttpStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
+function messageIncludesAny(message: string, needles: string[]): boolean {
+  return needles.some((needle) => message.includes(needle));
+}
+
 function isTransientFetchError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
@@ -305,7 +309,7 @@ function isTransientFetchError(error: unknown): boolean {
 
   return (
     error instanceof TypeError ||
-    [
+    messageIncludesAny(message, [
       "fetch failed",
       "network",
       "timeout",
@@ -314,7 +318,7 @@ function isTransientFetchError(error: unknown): boolean {
       "econnreset",
       "etimedout",
       "eai_again",
-    ].some((needle) => message.includes(needle))
+    ])
   );
 }
 
@@ -328,11 +332,11 @@ function isTransientYtDlpError(error: unknown): boolean {
       ? error.stderr.toLowerCase()
       : error.message.toLowerCase();
 
-  if (message.includes("enoent") || message.includes("eacces")) {
+  if (messageIncludesAny(message, ["enoent", "eacces"])) {
     return false;
   }
 
-  return [
+  return messageIncludesAny(message, [
     "http error 408",
     "http error 429",
     "http error 5",
@@ -343,7 +347,7 @@ function isTransientYtDlpError(error: unknown): boolean {
     "econnreset",
     "etimedout",
     "eai_again",
-  ].some((needle) => message.includes(needle));
+  ]);
 }
 
 async function fetchTagSearchResponse(

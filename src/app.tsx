@@ -93,6 +93,16 @@ type ScreenHandlers = {
   goToPostEditStage: (draft: ConfigDraft) => void;
 };
 
+// Shared props for the single-field setup screens (token, prefix, NicoNico
+// user/password/session). Each renders a FieldScreen with one text/password
+// input and drives the draft through the setup flow via these handlers.
+type InputScreenProps = {
+  headerProps: HeaderProps;
+  draft: ConfigDraft;
+  validationIssues: string[];
+  handlers: ScreenHandlers;
+};
+
 function getInitialStage(
   autoStart: boolean,
   draft: ConfigDraft,
@@ -675,12 +685,7 @@ function TokenScreen({
   draft,
   validationIssues,
   handlers,
-}: {
-  headerProps: HeaderProps;
-  draft: ConfigDraft;
-  validationIssues: string[];
-  handlers: ScreenHandlers;
-}) {
+}: InputScreenProps) {
   return (
     <FieldScreen
       headerProps={headerProps}
@@ -722,12 +727,7 @@ function PrefixScreen({
   draft,
   validationIssues,
   handlers,
-}: {
-  headerProps: HeaderProps;
-  draft: ConfigDraft;
-  validationIssues: string[];
-  handlers: ScreenHandlers;
-}) {
+}: InputScreenProps) {
   return (
     <FieldScreen
       headerProps={headerProps}
@@ -762,12 +762,7 @@ function NiconicoUserScreen({
   draft,
   validationIssues,
   handlers,
-}: {
-  headerProps: HeaderProps;
-  draft: ConfigDraft;
-  validationIssues: string[];
-  handlers: ScreenHandlers;
-}) {
+}: InputScreenProps) {
   return (
     <FieldScreen
       headerProps={headerProps}
@@ -807,12 +802,7 @@ function NiconicoPasswordScreen({
   draft,
   validationIssues,
   handlers,
-}: {
-  headerProps: HeaderProps;
-  draft: ConfigDraft;
-  validationIssues: string[];
-  handlers: ScreenHandlers;
-}) {
+}: InputScreenProps) {
   return (
     <FieldScreen
       headerProps={headerProps}
@@ -857,12 +847,7 @@ function NiconicoSessionScreen({
   draft,
   validationIssues,
   handlers,
-}: {
-  headerProps: HeaderProps;
-  draft: ConfigDraft;
-  validationIssues: string[];
-  handlers: ScreenHandlers;
-}) {
+}: InputScreenProps) {
   return (
     <FieldScreen
       headerProps={headerProps}
