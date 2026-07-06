@@ -29,6 +29,7 @@ import {
 } from "discord.js";
 import type { ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
+import { normalizeErrorMessage } from "./errors.js";
 import {
   buildNiconicoCookieFile,
   fetchEntries,
@@ -52,14 +53,6 @@ import type {
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
-
-function formatError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  return String(error);
-}
 
 function clampVolume(level: number): number {
   return Math.max(0, Math.min(level, 300));
@@ -139,7 +132,7 @@ async function runSetupCommand(
 
     return {
       ok: false,
-      output: formatError(error),
+      output: normalizeErrorMessage(error),
     };
   }
 }
@@ -456,7 +449,7 @@ class GuildController {
         this.updateSnapshot();
         return;
       } catch (error) {
-        this.lastError = formatError(error);
+        this.lastError = normalizeErrorMessage(error);
         this.service.log(
           "warn",
           `[${this.guild.name}] Voice connect retry ${attempt}/3 failed: ${this.lastError}`,
@@ -877,7 +870,7 @@ class GuildController {
         await this.notify(`Now playing: ${title}\n${url}`);
         return;
       } catch (error) {
-        this.lastError = formatError(error);
+        this.lastError = normalizeErrorMessage(error);
         this.playbackStatus = "error";
         this.updateSnapshot();
         this.service.log(
@@ -1044,7 +1037,7 @@ export class NicomusicBotService {
     } catch (error) {
       this.log(
         "warn",
-        `Could not prepare the NicoNico cookie file: ${formatError(error)}`,
+        `Could not prepare the NicoNico cookie file: ${normalizeErrorMessage(error)}`,
       );
     }
   }
@@ -1106,9 +1099,12 @@ export class NicomusicBotService {
       this.store.setStatus("running");
       this.log("success", `Logged in as ${readyClient.user.tag}.`);
     } catch (error) {
-      this.store.setStatus("error", formatError(error));
+      this.store.setStatus("error", normalizeErrorMessage(error));
       this.store.setProgress(undefined);
-      this.log("error", `Discord login failed: ${formatError(error)}`);
+      this.log(
+        "error",
+        `Discord login failed: ${normalizeErrorMessage(error)}`,
+      );
       client.destroy();
       this.client = undefined;
       await this.cleanupCookieFile();
@@ -1219,7 +1215,7 @@ export class NicomusicBotService {
           break;
       }
     } catch (error) {
-      const details = formatError(error);
+      const details = normalizeErrorMessage(error);
       this.log("error", `[${message.guild.name}] ${command}: ${details}`);
       await sendWithRetry(channel, `Command failed: ${details}`);
     }
@@ -1471,7 +1467,10 @@ export class NicomusicBotService {
         );
         await sleep(waitTime);
       } catch (error) {
-        this.log("warn", `Discord API probe failed: ${formatError(error)}`);
+        this.log(
+          "warn",
+          `Discord API probe failed: ${normalizeErrorMessage(error)}`,
+        );
         return;
       }
     }

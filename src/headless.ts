@@ -10,7 +10,7 @@ import {
   saveConfigToDisk,
   type CliOptions,
 } from "./config.js";
-import { normalizeError } from "./errors.js";
+import { normalizeError, normalizeErrorMessage } from "./errors.js";
 import { RuntimeStore } from "./runtime-store.js";
 import type {
   BotConfig,
@@ -202,7 +202,7 @@ export async function runHeadless(
     await waitForShutdown({ service, store, config });
     return 0;
   } catch (error) {
-    const message = normalizeError(error).message;
+    const message = normalizeErrorMessage(error);
 
     store.setStatus("error", message);
     store.addLog("error", message);

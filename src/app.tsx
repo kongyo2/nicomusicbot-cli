@@ -31,6 +31,7 @@ import {
   checkPrerequisites,
 } from "./bot-service.js";
 import { RuntimeStore } from "./runtime-store.js";
+import { normalizeErrorMessage } from "./errors.js";
 import type {
   ConfigDraft,
   DashboardState,
@@ -454,7 +455,7 @@ export function App({
     };
 
     run().catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = normalizeErrorMessage(error);
 
       nextStore.setStatus("error", message);
       nextStore.setProgress(undefined);

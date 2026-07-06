@@ -5,7 +5,7 @@ import { render } from "ink";
 import { err, ok, type Result } from "neverthrow";
 import { App } from "./app.js";
 import { getHelpText, loadInitialDraft, parseCliOptions } from "./config.js";
-import { normalizeError } from "./errors.js";
+import { normalizeError, normalizeErrorMessage } from "./errors.js";
 import { runHeadless } from "./headless.js";
 import { shouldUseHeadlessMode } from "./terminal.js";
 
@@ -80,7 +80,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  const message = normalizeError(error).message;
+  const message = normalizeErrorMessage(error);
   safeWrite(process.stderr, `${message}\n`);
   process.exitCode = 1;
 });

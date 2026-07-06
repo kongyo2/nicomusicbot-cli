@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { z } from "zod";
+import { normalizeErrorMessage } from "./errors.js";
 import type { BotConfig, ConfigDraft } from "./types.js";
 
 type PersistedConfig = {
@@ -221,7 +222,7 @@ async function loadPersistedConfig(configPath: string): Promise<{
       config: result.data,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = normalizeErrorMessage(error);
 
     if (message.includes("ENOENT")) {
       return { loaded: false, config: {} };

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { err, fromPromise, ok, type Result } from "neverthrow";
+import { normalizeError, normalizeErrorMessage } from "./errors.js";
 import { withRetry, type RetryOptions } from "./retry.js";
 import type { TrackEntry } from "./types.js";
 
@@ -145,8 +146,12 @@ function isVideoId(value: string): boolean {
   );
 }
 
+function stripWrappingBrackets(input: string): string {
+  return input.trim().replace(/^<|>$/g, "");
+}
+
 export function normalizeNiconicoUrl(input: string): string {
-  let url = input.trim().replace(/^<|>$/g, "");
+  let url = stripWrappingBrackets(input);
 
   if (!url) {
     return url;
@@ -230,7 +235,7 @@ async function runYtDlpJson(
         shouldRetry: isTransientYtDlpError,
       },
     ),
-    (error) => (error instanceof Error ? error : new Error(String(error))),
+    normalizeError,
   );
 
   if (result.isErr()) {
@@ -441,7 +446,7 @@ export async function resolveTrackTitle(
 }
 
 function extractTagFromInput(input: string): string {
-  const cleaned = input.trim().replace(/^<|>$/g, "");
+  const cleaned = stripWrappingBrackets(input);
 
   if (!cleaned.includes("/tag/")) {
     return cleaned;
@@ -497,9 +502,7 @@ export async function searchByTag(
   const responseResult = await fromPromise(
     fetchTagSearchResponse(url, retryOptions),
     (error) =>
-      new Error(
-        `Tag search request failed: ${error instanceof Error ? error.message : String(error)}`,
-      ),
+      new Error(`Tag search request failed: ${normalizeErrorMessage(error)}`),
   );
 
   if (responseResult.isErr()) {
@@ -516,7 +519,7 @@ export async function searchByTag(
     response.json(),
     (error) =>
       new Error(
-        `Failed to decode tag search response: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to decode tag search response: ${normalizeErrorMessage(error)}`,
       ),
   );
 
