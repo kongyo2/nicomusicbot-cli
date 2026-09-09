@@ -397,15 +397,50 @@ export function classifyNiconicoUrl(input: string): NiconicoResource {
 }
 
 /**
- * NicoNico addresses ranking genres by opaque keys (`e9uj2uks` = 総合), but
- * older links and the "all" alias use readable slugs. Resolve whatever the URL
- * carried into a key the API accepts, falling back to the overall ranking
- * rather than failing the request outright.
+ * Legacy readable genre slugs mapped to the genre labels NicoNico still
+ * reports. Modern ranking URLs use opaque keys, and the site now 302s a slug
+ * URL to the overall ranking, so translating them here recovers the genre an
+ * older bookmark actually asked for. Going via the label rather than a
+ * hardcoded key keeps this working if NicoNico rotates its keys.
+ */
+const RANKING_GENRE_SLUG_LABELS: Record<string, string> = {
+  all: "総合",
+  game: "ゲーム",
+  anime: "アニメ",
+  vocaloid: "ボカロ",
+  voicesynthesis: "音声合成実況・解説・劇場",
+  entertainment: "エンタメ",
+  music: "音楽",
+  music_sound: "音楽",
+  sing: "歌ってみた",
+  dance: "踊ってみた",
+  play: "演奏してみた",
+  commentary_lecture: "解説・講座",
+  cooking: "料理",
+  traveling_outdoor: "旅行・アウトドア",
+  nature: "自然",
+  vehicle: "乗り物",
+  technology_craft: "技術・工作",
+  society_politics_news: "社会・政治・時事",
+  mmd: "MMD",
+  vtuber: "VTuber",
+  radio: "ラジオ",
+  sports: "スポーツ",
+  animal: "動物",
+  other: "その他",
+};
+
+/**
+ * Resolve whatever a ranking URL carried — an opaque key, a legacy slug, or a
+ * genre label — into a key the API accepts. Falls back to the overall ranking
+ * rather than failing the request, but says so instead of substituting it
+ * silently.
  */
 async function resolveRankingGenreKey(
   client: NiconicoClient,
   featuredKey: string | undefined,
-): Promise<string | undefined> {
+  log?: NiconicoLogger,
+): Promise<string> {
   if (!featuredKey || featuredKey === "all") {
     return RANKING_ALL_KEY;
   }
@@ -417,10 +452,27 @@ async function resolveRankingGenreKey(
       return featuredKey;
     }
 
-    const byLabel = genres.find((genre) => genre.label === featuredKey);
+    const label = RANKING_GENRE_SLUG_LABELS[featuredKey.toLowerCase()];
+    const matched = genres.find(
+      (genre) => genre.label === label || genre.label === featuredKey,
+    );
 
-    return byLabel?.featuredKey ?? RANKING_ALL_KEY;
-  } catch {
+    if (matched) {
+      return matched.featuredKey;
+    }
+
+    log?.(
+      "warn",
+      `Unknown ranking genre "${featuredKey}"; using the overall ranking instead.`,
+    );
+
+    return RANKING_ALL_KEY;
+  } catch (error) {
+    log?.(
+      "warn",
+      `Could not list ranking genres (${normalizeErrorMessage(error)}); using the overall ranking.`,
+    );
+
     return RANKING_ALL_KEY;
   }
 }
@@ -458,6 +510,7 @@ async function resolveResourceEntries(
   resource: NiconicoResource,
   auth: NicoAuth,
   limit: number,
+  log?: NiconicoLogger,
 ): Promise<TrackEntry[]> {
   const client = getNiconicoClient(auth);
 
@@ -486,13 +539,19 @@ async function resolveResourceEntries(
     }
 
     case "series": {
-      const result = await client.series.getSeries(resource.seriesId, {
-        pageSize: PAGE_SIZE,
-      });
+      const items = await collectPaged(async (page) => {
+        const result = await client.series.getSeries(resource.seriesId, {
+          pageSize: PAGE_SIZE,
+          page,
+        });
 
-      return result.items
-        .slice(0, limit)
-        .map((item) => entryFromEssentialVideo(item.video));
+        return {
+          items: result.items,
+          hasNext: page * PAGE_SIZE < result.totalCount,
+        };
+      }, limit);
+
+      return items.map((item) => entryFromEssentialVideo(item.video));
     }
 
     case "user": {
@@ -515,6 +574,7 @@ async function resolveResourceEntries(
       const featuredKey = await resolveRankingGenreKey(
         client,
         resource.featuredKey,
+        log,
       );
       const result = await client.ranking.getRanking({
         ...(featuredKey ? { featuredKey } : {}),
@@ -700,7 +760,12 @@ export async function fetchEntries(
 
   if (resource.kind !== "unknown") {
     try {
-      const entries = await resolveResourceEntries(resource, auth, limit);
+      const entries = await resolveResourceEntries(
+        resource,
+        auth,
+        limit,
+        options.log,
+      );
 
       if (entries.length > 0) {
         return entries;

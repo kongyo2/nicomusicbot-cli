@@ -91,6 +91,26 @@ async function sendWithRetry(
   }
 }
 
+/**
+ * Resolve once the child process is actually running, and reject when the
+ * binary is missing. `spawn()` surfaces ENOENT asynchronously, so without this
+ * a caller sees healthy stdio streams, announces the track, and then hits EOF
+ * and skips it with nothing said in the channel.
+ */
+export async function waitForSpawn(
+  child: ChildProcess,
+  command: string,
+): Promise<void> {
+  try {
+    await once(child, "spawn");
+  } catch (error) {
+    throw new Error(
+      `Could not start ${command}: ${normalizeErrorMessage(error)}`,
+      { cause: error },
+    );
+  }
+}
+
 async function commandExists(command: string): Promise<boolean> {
   const locator = process.platform === "win32" ? "where.exe" : "which";
 
@@ -819,12 +839,34 @@ class GuildController {
           throw new Error("Audio pipeline could not be created.");
         }
 
+        ffmpeg.on("error", (error) => {
+          this.service.log(
+            "error",
+            `[${this.guild.name}] ffmpeg process error: ${error.message}`,
+          );
+        });
+
+        // spawn() reports a missing binary asynchronously via an "error"
+        // event, long after the stdio streams look healthy. Without this the
+        // track would be announced as playing and then silently skipped.
+        await waitForSpawn(ffmpeg, "ffmpeg");
+
         if (!native) {
           const ytDlp = this.spawnYtDlp(url);
 
           if (!ytDlp.stdout || !ffmpeg.stdin) {
             throw new Error("Audio pipeline could not be created.");
           }
+
+          ytDlp.on("error", (error) => {
+            this.service.log(
+              "error",
+              `[${this.guild.name}] yt-dlp process error: ${error.message}`,
+            );
+          });
+
+          // yt-dlp is optional now, so a machine without it reaches here.
+          await waitForSpawn(ytDlp, "yt-dlp");
 
           ytDlp.stdout.pipe(ffmpeg.stdin);
           ytDlp.on("close", (code) => {
@@ -839,12 +881,6 @@ class GuildController {
                 `[${this.guild.name}] yt-dlp exited with code ${code} during "${title}"; the stream may have been cut short.`,
               );
             }
-          });
-          ytDlp.on("error", (error) => {
-            this.service.log(
-              "error",
-              `[${this.guild.name}] yt-dlp process error: ${error.message}`,
-            );
           });
           ffmpeg.stdin.on("error", (error) => {
             if ("code" in error && error.code === "EPIPE") {
@@ -861,13 +897,6 @@ class GuildController {
         }
 
         this.ffmpegProcess = ffmpeg;
-
-        ffmpeg.on("error", (error) => {
-          this.service.log(
-            "error",
-            `[${this.guild.name}] ffmpeg process error: ${error.message}`,
-          );
-        });
 
         const resource = createAudioResource(ffmpeg.stdout, {
           inputType: StreamType.Raw,

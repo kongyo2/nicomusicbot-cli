@@ -357,10 +357,12 @@ describe("niconico helpers", () => {
       );
     });
 
-    it("falls back to the overall ranking for an unknown slug", async () => {
+    // nicovideo.jp itself 302s a legacy slug URL to the overall ranking, so
+    // translating the slug recovers the genre the link actually asked for.
+    it("translates a legacy readable slug to its current genre key", async () => {
       const fetchMock = vi
         .fn<typeof fetch>()
-        .mockImplementation(async () => rankingResponse("e9uj2uks", "総合"));
+        .mockImplementation(async () => rankingResponse("wq76qdin", "音楽"));
 
       vi.stubGlobal("fetch", fetchMock);
 
@@ -370,9 +372,84 @@ describe("niconico helpers", () => {
       );
 
       expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain(
-        "/genre/e9uj2uks",
+        "/genre/wq76qdin",
       );
     });
+
+    it("resolves a genre label as well as a slug", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async () => rankingResponse("wq76qdin", "音楽"));
+
+      vi.stubGlobal("fetch", fetchMock);
+
+      await fetchEntries("https://www.nicovideo.jp/ranking/genre/音楽", {});
+
+      expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain(
+        "/genre/wq76qdin",
+      );
+    });
+
+    it("warns instead of silently substituting for an unrecognized genre", async () => {
+      const fetchMock = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async () => rankingResponse("e9uj2uks", "総合"));
+      const log = vi.fn();
+
+      vi.stubGlobal("fetch", fetchMock);
+
+      await fetchEntries(
+        "https://www.nicovideo.jp/ranking/genre/not_a_genre",
+        {},
+        { log },
+      );
+
+      expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain(
+        "/genre/e9uj2uks",
+      );
+      expect(log).toHaveBeenCalledWith(
+        "warn",
+        expect.stringContaining('Unknown ranking genre "not_a_genre"'),
+      );
+    });
+  });
+
+  // Regression: the series path used to fetch a single page and slice it, so
+  // a series longer than one page silently lost its tail.
+  it("pages through a series longer than one request", async () => {
+    const seriesPage = (page: number, totalCount: number) =>
+      Response.json({
+        meta: { status: 200 },
+        data: {
+          detail: { id: 1, title: "long series" },
+          totalCount,
+          items: Array.from({ length: 100 }, (_, index) => ({
+            meta: { id: `m${page}-${index}` },
+            video: {
+              id: `sm${page}${String(index).padStart(3, "0")}`,
+              title: `track ${page}-${index}`,
+              duration: 60,
+            },
+          })),
+        },
+      });
+
+    let page = 0;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => {
+      page += 1;
+      return seriesPage(page, 250);
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const entries = await fetchEntries(
+      "https://www.nicovideo.jp/series/176162",
+      {},
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(entries).toHaveLength(250);
+    expect(new Set(entries.map((entry) => entry.id)).size).toBe(250);
   });
 
   it("requests an audio-only stream and returns the CDN headers", async () => {
