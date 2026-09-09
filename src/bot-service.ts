@@ -1192,6 +1192,14 @@ export class NicomusicBotService {
           "success",
           `NicoNico session verified as ${user.nickname}${user.isPremium ? " (premium)" : ""}.`,
         );
+      } else {
+        // A session was configured but did not parse into a usable cookie
+        // value, so the client never logged in. Say so rather than starting
+        // up silently as a guest.
+        this.log(
+          "warn",
+          "The configured NicoNico session could not be used; playback runs as a guest.",
+        );
       }
     } catch (error) {
       this.log(

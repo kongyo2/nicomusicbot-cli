@@ -517,9 +517,12 @@ describe("niconico helpers", () => {
       audioStreamId: "audio-aac-128kbps",
       audioBitRate: 128000,
     });
+    // The Domand cookie is the load-bearing header: the CDN rejects the
+    // playlist request without it.
     expect(stream.headers).toMatchObject({
       Origin: "https://www.nicovideo.jp",
       Referer: "https://www.nicovideo.jp/",
+      Cookie: "domand_bid=bid-value",
     });
 
     // Crucially: no videoStreamId in the outputs, so the CDN serves audio only.
@@ -548,6 +551,28 @@ describe("niconico helpers", () => {
     await expect(resolveNativeAudioStream({ id: "so123" }, {})).rejects.toThrow(
       /no DMS stream/,
     );
+  });
+
+  // Regression: when both paths fail the user used to see only the yt-dlp
+  // error, losing the NicoNico reason that actually explains the failure.
+  it("reports both failures when the yt-dlp fallback also fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(new Response("nope", { status: 404 })),
+    );
+
+    // yt-dlp is not on PATH under this name, so the fallback fails too.
+    const error = await fetchEntries(
+      "https://www.nicovideo.jp/mylist/1",
+      {},
+    ).catch((caught: unknown) => caught as Error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toMatch(/NicoNico mylist lookup failed/);
+    expect(error.message).toMatch(/yt-dlp fallback failed/);
+    expect(error.cause).toBeDefined();
   });
 
   it("refuses to resolve a non-video reference", async () => {

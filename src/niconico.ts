@@ -757,6 +757,7 @@ export async function fetchEntries(
 ): Promise<TrackEntry[]> {
   const limit = options.limit ?? COLLECTION_LIMIT;
   const resource = classifyNiconicoUrl(url);
+  let nativeError: unknown;
 
   if (resource.kind !== "unknown") {
     try {
@@ -776,6 +777,7 @@ export async function fetchEntries(
         `NicoNico returned no ${resource.kind} entries for "${url}"; trying yt-dlp.`,
       );
     } catch (error) {
+      nativeError = error;
       options.log?.(
         "warn",
         `Native ${resource.kind} lookup failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
@@ -783,7 +785,21 @@ export async function fetchEntries(
     }
   }
 
-  return fetchEntriesWithYtDlp(url, auth);
+  try {
+    return await fetchEntriesWithYtDlp(url, auth);
+  } catch (fallbackError) {
+    if (nativeError === undefined) {
+      throw fallbackError;
+    }
+
+    // Report both halves: only the dashboard sees the warning above, so
+    // without this the user is told yt-dlp failed and never learns why
+    // NicoNico did — which is usually the actionable half.
+    throw new Error(
+      `NicoNico ${resource.kind} lookup failed (${normalizeErrorMessage(nativeError)}) and the yt-dlp fallback failed (${normalizeErrorMessage(fallbackError)}).`,
+      { cause: fallbackError },
+    );
+  }
 }
 
 export type NativeAudioStream = {
