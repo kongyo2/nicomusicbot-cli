@@ -15,7 +15,10 @@ export type DependencyCheck = {
   command: string;
   ok: boolean;
   details: string;
+  /** Blocks startup when missing. */
   required: boolean;
+  /** Opt in to package-manager auto-installation when missing. */
+  autoInstall?: boolean;
 };
 
 export type DependencySetupResult = {
@@ -35,6 +38,7 @@ export type TrackEntry = {
   url?: string;
   webpageUrl?: string;
   requestedBy?: string;
+  durationSeconds?: number;
 };
 
 export type GuildSnapshot = {

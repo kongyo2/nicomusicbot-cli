@@ -36,8 +36,12 @@ import {
   makeTrackUrl,
   normalizeNiconicoUrl,
   parseTagRequest,
+  resolveNativeAudioStream,
   resolveTrackTitle,
   searchByTag,
+  verifyNiconicoSession,
+  type NativeAudioStream,
+  type NicoAuth,
 } from "./niconico.js";
 import { sleep } from "./retry.js";
 import { RuntimeStore } from "./runtime-store.js";
@@ -207,7 +211,7 @@ export async function autoSetupPrerequisites(
 ): Promise<DependencySetupResult> {
   const missingCommands = new Set(
     checks
-      .filter((check) => !check.ok && check.required)
+      .filter((check) => !check.ok && check.autoInstall === true)
       .map((check) => check.command),
   );
 
@@ -324,8 +328,13 @@ export async function checkPrerequisites(): Promise<DependencyCheck[]> {
       name: "yt-dlp",
       command: "yt-dlp",
       ok: checks[0],
-      details: checks[0] ? "Found in PATH." : "Not found in PATH.",
-      required: true,
+      details: checks[0]
+        ? "Found in PATH."
+        : "Not found in PATH. Only needed as a fallback; NicoNico playback uses the built-in client.",
+      // No longer required: @kongyo2/niconicojs resolves streams natively and
+      // yt-dlp is consulted only when that fails.
+      required: false,
+      autoInstall: true,
     },
     {
       name: "ffmpeg",
@@ -333,6 +342,7 @@ export async function checkPrerequisites(): Promise<DependencyCheck[]> {
       ok: checks[1],
       details: checks[1] ? "Found in PATH." : "Not found in PATH.",
       required: true,
+      autoInstall: true,
     },
     {
       name: "opus backend",
@@ -794,56 +804,68 @@ class GuildController {
       }
 
       try {
+        const native = await this.resolveNativeStream(next);
         const title =
+          native?.title ??
           (await resolveTrackTitle(next, this.service.niconicoAuth())) ??
           next.title ??
           next.id ??
           "Unknown";
-        const ytDlp = this.spawnYtDlp(url);
-        const ffmpeg = this.spawnFfmpeg();
+        const ffmpeg = native
+          ? this.spawnFfmpegFromUrl(native)
+          : this.spawnFfmpegFromPipe();
 
-        if (!ytDlp.stdout || !ffmpeg.stdin || !ffmpeg.stdout) {
+        if (!ffmpeg.stdout) {
           throw new Error("Audio pipeline could not be created.");
         }
 
-        ytDlp.stdout.pipe(ffmpeg.stdin);
-        ytDlp.on("close", (code) => {
-          ffmpeg.stdin?.end();
+        if (!native) {
+          const ytDlp = this.spawnYtDlp(url);
 
-          // A non-zero exit while this track is still current means the stream
-          // ended early. Surface it so the truncation is diagnosable instead of
-          // silently looking like a normal end-of-track.
-          if (code && code !== 0 && this.current?.id === next.id) {
+          if (!ytDlp.stdout || !ffmpeg.stdin) {
+            throw new Error("Audio pipeline could not be created.");
+          }
+
+          ytDlp.stdout.pipe(ffmpeg.stdin);
+          ytDlp.on("close", (code) => {
+            ffmpeg.stdin?.end();
+
+            // A non-zero exit while this track is still current means the
+            // stream ended early. Surface it so the truncation is diagnosable
+            // instead of silently looking like a normal end-of-track.
+            if (code && code !== 0 && this.current?.id === next.id) {
+              this.service.log(
+                "warn",
+                `[${this.guild.name}] yt-dlp exited with code ${code} during "${title}"; the stream may have been cut short.`,
+              );
+            }
+          });
+          ytDlp.on("error", (error) => {
+            this.service.log(
+              "error",
+              `[${this.guild.name}] yt-dlp process error: ${error.message}`,
+            );
+          });
+          ffmpeg.stdin.on("error", (error) => {
+            if ("code" in error && error.code === "EPIPE") {
+              return;
+            }
+
             this.service.log(
               "warn",
-              `[${this.guild.name}] yt-dlp exited with code ${code} during "${title}"; the stream may have been cut short.`,
+              `[${this.guild.name}] ffmpeg stdin error: ${error.message}`,
             );
-          }
-        });
+          });
 
-        this.ytDlpProcess = ytDlp;
+          this.ytDlpProcess = ytDlp;
+        }
+
         this.ffmpegProcess = ffmpeg;
 
-        ytDlp.on("error", (error) => {
-          this.service.log(
-            "error",
-            `[${this.guild.name}] yt-dlp process error: ${error.message}`,
-          );
-        });
         ffmpeg.on("error", (error) => {
           this.service.log(
             "error",
             `[${this.guild.name}] ffmpeg process error: ${error.message}`,
-          );
-        });
-        ffmpeg.stdin.on("error", (error) => {
-          if ("code" in error && error.code === "EPIPE") {
-            return;
-          }
-
-          this.service.log(
-            "warn",
-            `[${this.guild.name}] ffmpeg stdin error: ${error.message}`,
           );
         });
 
@@ -931,7 +953,87 @@ class GuildController {
     );
   }
 
-  private spawnFfmpeg(): ChildProcess {
+  /**
+   * Ask NicoNico's DMS API for an audio-only HLS playlist. Returns undefined
+   * when the native path cannot serve the track, which sends the caller down
+   * the yt-dlp fallback.
+   */
+  private async resolveNativeStream(
+    entry: TrackEntry,
+  ): Promise<NativeAudioStream | undefined> {
+    try {
+      const stream = await resolveNativeAudioStream(
+        entry,
+        this.service.niconicoAuth(),
+      );
+
+      this.service.log(
+        "info",
+        `[${this.guild.name}] Resolved "${stream.title}" via NicoNico DMS (${Math.round(stream.audioBitRate / 1000)} kbps audio-only).`,
+      );
+
+      return stream;
+    } catch (error) {
+      this.service.log(
+        "warn",
+        `[${this.guild.name}] Native stream resolution failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
+      );
+
+      return undefined;
+    }
+  }
+
+  /**
+   * Decode a signed HLS playlist straight to PCM. ffmpeg fetches the segments
+   * itself, so there is no second process in the pipeline at all.
+   */
+  private spawnFfmpegFromUrl(stream: NativeAudioStream): ChildProcess {
+    const headerLines = Object.entries(stream.headers)
+      .map(([name, value]) => `${name}: ${value}\r\n`)
+      .join("");
+
+    return spawn(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        // The CDN rejects requests without the Domand cookie and origin.
+        "-headers",
+        headerLines,
+        // A dropped segment fetch used to end the track early; reconnect
+        // instead so a network glitch costs seconds, not the rest of the song.
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_on_http_error",
+        "4xx,5xx",
+        "-reconnect_delay_max",
+        "30",
+        "-rw_timeout",
+        "30000000",
+        "-i",
+        stream.contentUrl,
+        "-vn",
+        "-f",
+        "s16le",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "pipe:1",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
+  }
+
+  private spawnFfmpegFromPipe(): ChildProcess {
     return spawn(
       "ffmpeg",
       [
@@ -983,18 +1085,16 @@ export class NicomusicBotService {
   }
 
   /**
-   * Auth object passed to the metadata helpers in niconico.ts. Prefers the
-   * `user_session` cookie because password login is unreliable (2FA and the
-   * broken yt-dlp login flow), falling back to username/password.
+   * Auth object passed to the helpers in niconico.ts. The raw `user_session`
+   * drives the native client; the cookies.txt path and username/password only
+   * matter to the yt-dlp fallback, where password login is unreliable anyway
+   * (2FA and the broken yt-dlp login flow).
    */
-  niconicoAuth(): {
-    niconicoUser?: string;
-    niconicoPassword?: string;
-    cookiesPath?: string;
-  } {
+  niconicoAuth(): NicoAuth {
     return {
       niconicoUser: this.config.niconicoUser,
       niconicoPassword: this.config.niconicoPassword,
+      niconicoSession: this.config.niconicoSession,
       cookiesPath: this.cookiesPath,
     };
   }
@@ -1042,6 +1142,36 @@ export class NicomusicBotService {
     }
   }
 
+  /**
+   * Confirm the NicoNico session before Discord login so an expired cookie
+   * shows up as one clear startup warning instead of a failure on every track.
+   */
+  private async verifySession(): Promise<void> {
+    if (!this.config.niconicoSession) {
+      this.log(
+        "info",
+        "No NicoNico session configured; playback runs as a guest.",
+      );
+      return;
+    }
+
+    try {
+      const user = await verifyNiconicoSession(this.niconicoAuth());
+
+      if (user) {
+        this.log(
+          "success",
+          `NicoNico session verified as ${user.nickname}${user.isPremium ? " (premium)" : ""}.`,
+        );
+      }
+    } catch (error) {
+      this.log(
+        "warn",
+        `NicoNico session check failed (${normalizeErrorMessage(error)}); continuing as a guest.`,
+      );
+    }
+  }
+
   private async cleanupCookieFile(): Promise<void> {
     const dir = this.cookiesDir;
     this.cookiesPath = undefined;
@@ -1066,6 +1196,7 @@ export class NicomusicBotService {
     });
     this.log("info", "Preparing Discord client...");
     await this.ensureCookieFile();
+    await this.verifySession();
     await this.waitForDiscordApi();
 
     const client = new Client({
@@ -1241,6 +1372,7 @@ export class NicomusicBotService {
     const entries = await fetchEntries(
       normalizeNiconicoUrl(rest),
       this.niconicoAuth(),
+      { log: (level, text) => this.log(level, text) },
     );
 
     if (entries.length === 0) {
@@ -1291,7 +1423,7 @@ export class NicomusicBotService {
       channel,
       `Searching NicoNico tag "${tag}" (limit ${limit})...`,
     );
-    const entries = await searchByTag(tag, limit);
+    const entries = await searchByTag(tag, limit, this.niconicoAuth());
 
     if (entries.length === 0) {
       await sendWithRetry(channel, "No tracks were found for that tag.");

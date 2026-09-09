@@ -24,12 +24,16 @@ describe("bot-service exports", () => {
         expect.objectContaining({
           command: "yt-dlp",
           ok: true,
-          required: true,
+          // Playback resolves through @kongyo2/niconicojs, so yt-dlp is only a
+          // fallback and must not block startup.
+          required: false,
+          autoInstall: true,
         }),
         expect.objectContaining({
           command: "ffmpeg",
           ok: true,
           required: true,
+          autoInstall: true,
         }),
         expect.objectContaining({
           command: "@discordjs/opus | node-opus | opusscript",
@@ -40,14 +44,33 @@ describe("bot-service exports", () => {
     );
   });
 
-  it("does not run auto setup when required checks are already OK", async () => {
+  it("does not run auto setup when installable checks are already OK", async () => {
     const checks: DependencyCheck[] = [
       {
         name: "yt-dlp",
         command: "yt-dlp",
         ok: true,
         details: "Found.",
-        required: true,
+        required: false,
+        autoInstall: true,
+      },
+    ];
+
+    await expect(autoSetupPrerequisites(checks)).resolves.toEqual({
+      attempted: false,
+      changed: false,
+      logs: [],
+    });
+  });
+
+  it("never tries to install a check that is not marked installable", async () => {
+    const checks: DependencyCheck[] = [
+      {
+        name: "opus backend",
+        command: "@discordjs/opus | node-opus | opusscript",
+        ok: false,
+        details: "Missing.",
+        required: false,
       },
     ];
 
