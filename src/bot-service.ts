@@ -111,6 +111,25 @@ export async function waitForSpawn(
   }
 }
 
+/** Keep only the tail of a child's stderr; enough to explain an exit code. */
+const STDERR_TAIL_LIMIT = 2_000;
+
+/**
+ * Consume a child's stderr and return a getter for its tail. Spawning with a
+ * piped stderr that nothing reads risks filling the pipe buffer and blocking
+ * the child, so this is about liveness as much as diagnostics.
+ */
+export function drainStderr(child: ChildProcess): () => string {
+  let buffered = "";
+
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    buffered = `${buffered}${chunk}`.slice(-STDERR_TAIL_LIMIT);
+  });
+
+  return () => buffered;
+}
+
 async function commandExists(command: string): Promise<boolean> {
   const locator = process.platform === "win32" ? "where.exe" : "which";
 
@@ -823,8 +842,11 @@ class GuildController {
         continue;
       }
 
+      const { stream: native, error: nativeError } =
+        await this.resolveNativeStream(next);
+      let ytDlpStderr: (() => string) | undefined;
+
       try {
-        const native = await this.resolveNativeStream(next);
         const title =
           native?.title ??
           (await resolveTrackTitle(next, this.service.niconicoAuth())) ??
@@ -853,6 +875,34 @@ class GuildController {
           );
         });
 
+        // stderr is a pipe nobody reads otherwise: drain it so a chatty
+        // failure cannot fill the buffer and wedge ffmpeg, and keep the tail
+        // to explain a nonzero exit.
+        const ffmpegStderr = drainStderr(ffmpeg);
+
+        // A failure after a clean start (an expired playlist, an HTTP error
+        // from the CDN) arrives as "close", not "error". Its stdout just hits
+        // EOF, which the player reads as a finished track, so without this the
+        // channel sees "Now playing" and then silence.
+        ffmpeg.on("close", (code) => {
+          // Skip and stop kill the process, and ffmpeg handles SIGTERM itself
+          // rather than dying from it — measured, that surfaces as 255, or 0,
+          // or null with a signal depending on how far it had got. Only
+          // `killed` reliably separates that from a genuine failure.
+          if (code === 0 || ffmpeg.killed || this.current?.id !== next.id) {
+            return;
+          }
+
+          const details = ffmpegStderr().trim() || "no stderr output";
+          this.service.log(
+            "error",
+            `[${this.guild.name}] ffmpeg exited with code ${code} during "${title}": ${details}`,
+          );
+          void this.notify(
+            `Playback of ${title} stopped: ffmpeg exited with code ${code}.`,
+          );
+        });
+
         // spawn() reports a missing binary asynchronously via an "error"
         // event, long after the stdio streams look healthy. Without this the
         // track would be announced as playing and then silently skipped.
@@ -875,6 +925,9 @@ class GuildController {
             );
           });
 
+          // Same unread pipe as ffmpeg's, and yt-dlp is the noisier of the two.
+          ytDlpStderr = drainStderr(ytDlp);
+
           // yt-dlp is optional now, so a machine without it reaches here.
           await waitForSpawn(ytDlp, "yt-dlp");
 
@@ -886,9 +939,10 @@ class GuildController {
             // stream ended early. Surface it so the truncation is diagnosable
             // instead of silently looking like a normal end-of-track.
             if (code && code !== 0 && this.current?.id === next.id) {
+              const details = ytDlpStderr?.().trim() || "no stderr output";
               this.service.log(
                 "warn",
-                `[${this.guild.name}] yt-dlp exited with code ${code} during "${title}"; the stream may have been cut short.`,
+                `[${this.guild.name}] yt-dlp exited with code ${code} during "${title}"; the stream may have been cut short: ${details}`,
               );
             }
           });
@@ -927,7 +981,12 @@ class GuildController {
         await this.notify(`Now playing: ${title}\n${url}`);
         return;
       } catch (error) {
-        this.lastError = normalizeErrorMessage(error);
+        // The native failure is the actionable half when the fallback dies
+        // too, and it would otherwise only ever reach the dashboard log.
+        this.lastError =
+          nativeError === undefined
+            ? normalizeErrorMessage(error)
+            : `NicoNico playback failed (${normalizeErrorMessage(nativeError)}) and the yt-dlp fallback failed (${normalizeErrorMessage(error)})`;
         this.playbackStatus = "error";
         this.updateSnapshot();
         this.service.log(
@@ -995,7 +1054,7 @@ class GuildController {
    */
   private async resolveNativeStream(
     entry: TrackEntry,
-  ): Promise<NativeAudioStream | undefined> {
+  ): Promise<{ stream?: NativeAudioStream; error?: unknown }> {
     try {
       const stream = await resolveNativeAudioStream(
         entry,
@@ -1007,14 +1066,17 @@ class GuildController {
         `[${this.guild.name}] Resolved "${stream.title}" via NicoNico DMS (${Math.round(stream.audioBitRate / 1000)} kbps audio-only).`,
       );
 
-      return stream;
+      return { stream };
     } catch (error) {
       this.service.log(
         "warn",
         `[${this.guild.name}] Native stream resolution failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
       );
 
-      return undefined;
+      // Hand the error back rather than swallowing it: only the dashboard
+      // sees the warning above, and if the fallback fails too this is the
+      // half that explains why (membership required, deleted, and so on).
+      return { error };
     }
   }
 

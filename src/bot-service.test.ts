@@ -4,6 +4,7 @@ import {
   NicomusicBotService,
   autoSetupPrerequisites,
   checkPrerequisites,
+  drainStderr,
   waitForSpawn,
 } from "./bot-service.js";
 import { RuntimeStore } from "./runtime-store.js";
@@ -109,6 +110,49 @@ describe("bot-service exports", () => {
 
       await expect(waitForSpawn(child, "node")).resolves.toBeUndefined();
       child.kill();
+    });
+  });
+
+  // Regression: ffmpeg and yt-dlp are spawned with a piped stderr that nothing
+  // read, so a chatty failure could fill the pipe buffer and block the child,
+  // and a nonzero exit had no diagnostic attached.
+  describe("drainStderr", () => {
+    it("captures a child's stderr so the pipe cannot fill up", async () => {
+      const child = spawn(
+        process.execPath,
+        ["-e", "process.stderr.write('boom: bad input\\n'); process.exit(3)"],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const stderr = drainStderr(child);
+
+      const code = await new Promise((resolve) =>
+        child.on("close", resolve as (code: number) => void),
+      );
+
+      expect(code).toBe(3);
+      expect(stderr()).toContain("boom: bad input");
+    });
+
+    it("keeps only the tail of a very noisy child", async () => {
+      const child = spawn(
+        process.execPath,
+        [
+          "-e",
+          // Far more than the retained tail, and far more than a pipe buffer
+          // holds — this would block a child whose stderr nobody drained.
+          "for (let i = 0; i < 20000; i++) process.stderr.write(`line ${i}\\n`);",
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const stderr = drainStderr(child);
+
+      const code = await new Promise((resolve) =>
+        child.on("close", resolve as (code: number) => void),
+      );
+
+      expect(code).toBe(0);
+      expect(stderr().length).toBeLessThanOrEqual(2000);
+      expect(stderr()).toContain("line 19999");
     });
   });
 
