@@ -1,6 +1,6 @@
 {
   "name": "@kongyo2/nicomusicbot",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Ink-powered TypeScript port of NicomusicBot for Discord voice playback from NicoNico.",
   "license": "Unlicense",
   "type": "module",
@@ -37,6 +37,7 @@
   "dependencies": {
     "@discordjs/voice": "^0.19.2",
     "@inkjs/ui": "^2.0.0",
+    "@kongyo2/niconicojs": "^0.1.2",
     "discord.js": "^14.26.2",
     "ink": "^7.0.0",
     "neverthrow": "^8.2.0",

@@ -1,8 +1,11 @@
+import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
   NicomusicBotService,
   autoSetupPrerequisites,
   checkPrerequisites,
+  drainStderr,
+  waitForSpawn,
 } from "./bot-service.js";
 import { RuntimeStore } from "./runtime-store.js";
 import type { BotConfig, DependencyCheck } from "./types.js";
@@ -24,12 +27,16 @@ describe("bot-service exports", () => {
         expect.objectContaining({
           command: "yt-dlp",
           ok: true,
-          required: true,
+          // Playback resolves through @kongyo2/niconicojs, so yt-dlp is only a
+          // fallback and must not block startup.
+          required: false,
+          autoInstall: true,
         }),
         expect.objectContaining({
           command: "ffmpeg",
           ok: true,
           required: true,
+          autoInstall: true,
         }),
         expect.objectContaining({
           command: "@discordjs/opus | node-opus | opusscript",
@@ -40,14 +47,15 @@ describe("bot-service exports", () => {
     );
   });
 
-  it("does not run auto setup when required checks are already OK", async () => {
+  it("does not run auto setup when installable checks are already OK", async () => {
     const checks: DependencyCheck[] = [
       {
         name: "yt-dlp",
         command: "yt-dlp",
         ok: true,
         details: "Found.",
-        required: true,
+        required: false,
+        autoInstall: true,
       },
     ];
 
@@ -55,6 +63,96 @@ describe("bot-service exports", () => {
       attempted: false,
       changed: false,
       logs: [],
+    });
+  });
+
+  it("never tries to install a check that is not marked installable", async () => {
+    const checks: DependencyCheck[] = [
+      {
+        name: "opus backend",
+        command: "@discordjs/opus | node-opus | opusscript",
+        ok: false,
+        details: "Missing.",
+        required: false,
+      },
+    ];
+
+    await expect(autoSetupPrerequisites(checks)).resolves.toEqual({
+      attempted: false,
+      changed: false,
+      logs: [],
+    });
+  });
+
+  // Regression: spawn() reports a missing binary asynchronously, so the stdio
+  // streams look healthy and playback used to be announced for a track that
+  // then silently ended. Matters now that yt-dlp is optional.
+  describe("waitForSpawn", () => {
+    it("rejects when the binary is missing", async () => {
+      const child = spawn("nicomusicbot-no-such-binary", ["--version"], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child.on("error", () => undefined);
+
+      // The old guard checked this and would have let the track through.
+      expect(child.stdout).not.toBeNull();
+
+      await expect(waitForSpawn(child, "yt-dlp")).rejects.toThrow(
+        /Could not start yt-dlp.*ENOENT/s,
+      );
+    });
+
+    it("resolves once a real binary starts", async () => {
+      const child = spawn(process.execPath, ["--version"], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child.on("error", () => undefined);
+
+      await expect(waitForSpawn(child, "node")).resolves.toBeUndefined();
+      child.kill();
+    });
+  });
+
+  // Regression: ffmpeg and yt-dlp are spawned with a piped stderr that nothing
+  // read, so a chatty failure could fill the pipe buffer and block the child,
+  // and a nonzero exit had no diagnostic attached.
+  describe("drainStderr", () => {
+    it("captures a child's stderr so the pipe cannot fill up", async () => {
+      const child = spawn(
+        process.execPath,
+        ["-e", "process.stderr.write('boom: bad input\\n'); process.exit(3)"],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const stderr = drainStderr(child);
+
+      const code = await new Promise((resolve) =>
+        child.on("close", resolve as (code: number) => void),
+      );
+
+      expect(code).toBe(3);
+      expect(stderr()).toContain("boom: bad input");
+    });
+
+    it("keeps only the tail of a very noisy child", async () => {
+      const child = spawn(
+        process.execPath,
+        [
+          "-e",
+          // Far more than the retained tail, and far more than a pipe buffer
+          // holds — this would block a child whose stderr nobody drained.
+          "for (let i = 0; i < 20000; i++) process.stderr.write(`line ${i}\\n`);",
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const stderr = drainStderr(child);
+
+      const code = await new Promise((resolve) =>
+        child.on("close", resolve as (code: number) => void),
+      );
+
+      expect(code).toBe(0);
+      expect(stderr().length).toBeLessThanOrEqual(2000);
+      expect(stderr()).toContain("line 19999");
     });
   });
 

@@ -1,20 +1,37 @@
 import { spawn } from "node:child_process";
+import {
+  DomandUnavailableError,
+  NiconicoClient,
+  RANKING_ALL_KEY,
+  domandRequestHeaders,
+  isNiconicoApiError,
+  pickBestAudio,
+  type EssentialVideo,
+  type RankingTerm,
+  type WatchResult,
+} from "@kongyo2/niconicojs";
 import { err, fromPromise, ok, type Result } from "neverthrow";
 import { normalizeError, normalizeErrorMessage } from "./errors.js";
-import { withRetry, type RetryOptions } from "./retry.js";
+import { withRetry } from "./retry.js";
 import type { TrackEntry } from "./types.js";
 
-type NicoAuth = {
+export type NicoAuth = {
   niconicoUser?: string;
   niconicoPassword?: string;
   /**
+   * Raw NicoNico `user_session` cookie. Consumed directly by
+   * @kongyo2/niconicojs, which is the primary resolution path.
+   */
+  niconicoSession?: string;
+  /**
    * Path to a Netscape-format cookies.txt produced from the NicoNico
-   * `user_session` cookie. When present it takes precedence over
-   * username/password because cookie auth survives 2FA and the broken
-   * yt-dlp password login flow.
+   * `user_session` cookie. Only the yt-dlp fallback needs this; cookie auth
+   * survives 2FA and the broken yt-dlp password login flow.
    */
   cookiesPath?: string;
 };
+
+export type NiconicoLogger = (level: "info" | "warn", message: string) => void;
 
 const VIDEO_ID_PREFIXES = [
   "sm",
@@ -30,14 +47,10 @@ const VIDEO_ID_PREFIXES = [
   "z9",
 ] as const;
 
-class RetriableHttpError extends Error {
-  constructor(
-    readonly status: number,
-    readonly retryAfterMs?: number,
-  ) {
-    super(`Tag search API returned ${status}.`);
-  }
-}
+/** Cap on how many videos a single collection (mylist/series/user) contributes. */
+const COLLECTION_LIMIT = 250;
+/** NicoNico's own page-size ceiling for the nvapi list endpoints. */
+const PAGE_SIZE = 100;
 
 class YtDlpCommandError extends Error {
   constructor(
@@ -51,23 +64,88 @@ class YtDlpCommandError extends Error {
 }
 
 /**
- * Build a Netscape-format cookies.txt body from a NicoNico `user_session`
- * cookie value. Accepts either the raw value (`user_session_…`) or a
- * `name=value` pair pasted from devtools. Returns undefined when empty.
+ * Video is reachable but cannot be streamed by the native path (paid-only,
+ * members-only, deleted, or region locked). Callers use this to decide whether
+ * falling back to yt-dlp is worth attempting.
  */
-export function buildNiconicoCookieFile(session: string): string | undefined {
-  let value = session.trim();
+export class NiconicoUnplayableError extends Error {
+  constructor(
+    readonly videoId: string,
+    reason: string,
+  ) {
+    super(`NicoNico refused to stream ${videoId}: ${reason}`);
+    this.name = "NiconicoUnplayableError";
+  }
+}
+
+/**
+ * Always dereference `globalThis.fetch` at call time rather than capturing it
+ * when the client is built, so a stubbed fetch in tests is honoured no matter
+ * when the cached client was created.
+ */
+const lateBoundFetch = (input: string, init: RequestInit): Promise<Response> =>
+  globalThis.fetch(input, init);
+
+const clientCache = new Map<string, NiconicoClient>();
+
+export function resetNiconicoClientCache(): void {
+  clientCache.clear();
+}
+
+export function getNiconicoClient(auth: NicoAuth): NiconicoClient {
+  const session = normalizeSessionValue(auth.niconicoSession);
+  const key = session ?? "";
+  const cached = clientCache.get(key);
+
+  if (cached) {
+    return cached;
+  }
+
+  const client = new NiconicoClient({
+    session,
+    fetch: lateBoundFetch,
+    timeoutMs: 30_000,
+    retryAttempts: 3,
+  });
+
+  clientCache.set(key, client);
+
+  return client;
+}
+
+/**
+ * Reduce any of the shapes a user might paste — the bare value, a
+ * `user_session=…` pair, or a full `Cookie:` header — to the raw cookie value.
+ */
+export function normalizeSessionValue(
+  session: string | undefined,
+): string | undefined {
+  let value = session?.trim();
 
   if (!value) {
     return undefined;
   }
 
-  // Tolerate "user_session=user_session_…" or a full "Cookie:" header paste.
   value = value.replace(/^cookie:\s*/i, "");
   const sessionMatch = value.match(/user_session=([^;\s]+)/i);
 
   if (sessionMatch) {
     value = sessionMatch[1];
+  }
+
+  return value || undefined;
+}
+
+/**
+ * Build a Netscape-format cookies.txt body from a NicoNico `user_session`
+ * cookie value. Accepts either the raw value (`user_session_…`) or a
+ * `name=value` pair pasted from devtools. Returns undefined when empty.
+ */
+export function buildNiconicoCookieFile(session: string): string | undefined {
+  const value = normalizeSessionValue(session);
+
+  if (!value) {
+    return undefined;
   }
 
   // Far-future expiry so yt-dlp does not treat the cookie as a session cookie.
@@ -206,6 +284,368 @@ export function makeTrackUrl(entry: TrackEntry): string | undefined {
   return normalizeNiconicoUrl(value);
 }
 
+export type NiconicoResource =
+  | { kind: "video"; videoId: string }
+  | { kind: "mylist"; mylistId: string }
+  | { kind: "series"; seriesId: string }
+  | { kind: "user"; userId: string }
+  | { kind: "ranking"; featuredKey?: string; term?: RankingTerm; tag?: string }
+  | { kind: "tag"; tag: string }
+  | { kind: "search"; keyword: string }
+  | { kind: "unknown" };
+
+const RANKING_TERMS = new Set<string>([
+  "hour",
+  "24h",
+  "week",
+  "month",
+  "total",
+]);
+
+function decodeSegment(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Work out which NicoNico API can serve a pasted link. Anything unrecognised
+ * becomes `unknown` so the caller can hand it to the yt-dlp fallback rather
+ * than guessing.
+ */
+export function classifyNiconicoUrl(input: string): NiconicoResource {
+  const normalized = normalizeNiconicoUrl(input);
+  const bare = stripWrappingBrackets(input);
+
+  if (isVideoId(bare)) {
+    return { kind: "video", videoId: bare.toLowerCase() };
+  }
+
+  let url: URL;
+
+  try {
+    url = new URL(normalized);
+  } catch {
+    return { kind: "unknown" };
+  }
+
+  if (!/(^|\.)(nicovideo\.jp|nico\.ms)$/i.test(url.hostname)) {
+    return { kind: "unknown" };
+  }
+
+  const segments = url.pathname.split("/").filter(Boolean).map(decodeSegment);
+
+  if (segments.length === 0) {
+    return { kind: "unknown" };
+  }
+
+  const watchIndex = segments.indexOf("watch");
+
+  if (watchIndex >= 0 && segments[watchIndex + 1]) {
+    return { kind: "video", videoId: segments[watchIndex + 1].toLowerCase() };
+  }
+
+  const mylistIndex = segments.indexOf("mylist");
+
+  if (mylistIndex >= 0 && segments[mylistIndex + 1]) {
+    const mylistId = segments[mylistIndex + 1].split("?")[0];
+
+    if (/^\d+$/.test(mylistId)) {
+      return { kind: "mylist", mylistId };
+    }
+  }
+
+  const seriesIndex = segments.indexOf("series");
+
+  if (seriesIndex >= 0 && segments[seriesIndex + 1]) {
+    const seriesId = segments[seriesIndex + 1];
+
+    if (/^\d+$/.test(seriesId)) {
+      return { kind: "series", seriesId };
+    }
+  }
+
+  if (segments[0] === "ranking") {
+    const term = url.searchParams.get("term") ?? undefined;
+    const tag = url.searchParams.get("tag") ?? undefined;
+    // /ranking, /ranking/genre/<key>, /ranking/custom
+    const featuredKey = segments[1] === "genre" ? segments[2] : undefined;
+
+    return {
+      kind: "ranking",
+      ...(featuredKey ? { featuredKey } : {}),
+      ...(term && RANKING_TERMS.has(term) ? { term: term as RankingTerm } : {}),
+      ...(tag ? { tag } : {}),
+    };
+  }
+
+  if (segments[0] === "tag" && segments[1]) {
+    return { kind: "tag", tag: segments[1] };
+  }
+
+  if (segments[0] === "search" && segments[1]) {
+    return { kind: "search", keyword: segments[1] };
+  }
+
+  if (segments[0] === "user" && /^\d+$/.test(segments[1] ?? "")) {
+    return { kind: "user", userId: segments[1] };
+  }
+
+  return { kind: "unknown" };
+}
+
+/**
+ * Legacy readable genre slugs mapped to the genre labels NicoNico still
+ * reports. Modern ranking URLs use opaque keys, and the site now 302s a slug
+ * URL to the overall ranking, so translating them here recovers the genre an
+ * older bookmark actually asked for. Going via the label rather than a
+ * hardcoded key keeps this working if NicoNico rotates its keys.
+ */
+const RANKING_GENRE_SLUG_LABELS: Record<string, string> = {
+  all: "総合",
+  game: "ゲーム",
+  anime: "アニメ",
+  vocaloid: "ボカロ",
+  voicesynthesis: "音声合成実況・解説・劇場",
+  entertainment: "エンタメ",
+  music: "音楽",
+  music_sound: "音楽",
+  sing: "歌ってみた",
+  dance: "踊ってみた",
+  play: "演奏してみた",
+  commentary_lecture: "解説・講座",
+  cooking: "料理",
+  traveling_outdoor: "旅行・アウトドア",
+  nature: "自然",
+  vehicle: "乗り物",
+  technology_craft: "技術・工作",
+  society_politics_news: "社会・政治・時事",
+  mmd: "MMD",
+  vtuber: "VTuber",
+  radio: "ラジオ",
+  sports: "スポーツ",
+  animal: "動物",
+  other: "その他",
+};
+
+/**
+ * Resolve whatever a ranking URL carried — an opaque key, a legacy slug, or a
+ * genre label — into a key the API accepts. Falls back to the overall ranking
+ * rather than failing the request, but says so instead of substituting it
+ * silently.
+ */
+async function resolveRankingGenreKey(
+  client: NiconicoClient,
+  featuredKey: string | undefined,
+  log?: NiconicoLogger,
+): Promise<string> {
+  if (!featuredKey || featuredKey === "all") {
+    return RANKING_ALL_KEY;
+  }
+
+  try {
+    const genres = await client.ranking.getRankingGenres();
+
+    if (genres.some((genre) => genre.featuredKey === featuredKey)) {
+      return featuredKey;
+    }
+
+    const label = RANKING_GENRE_SLUG_LABELS[featuredKey.toLowerCase()];
+    const matched = genres.find(
+      (genre) => genre.label === label || genre.label === featuredKey,
+    );
+
+    if (matched) {
+      return matched.featuredKey;
+    }
+
+    log?.(
+      "warn",
+      `Unknown ranking genre "${featuredKey}"; using the overall ranking instead.`,
+    );
+
+    return RANKING_ALL_KEY;
+  } catch (error) {
+    log?.(
+      "warn",
+      `Could not list ranking genres (${normalizeErrorMessage(error)}); using the overall ranking.`,
+    );
+
+    return RANKING_ALL_KEY;
+  }
+}
+
+function entryFromEssentialVideo(video: EssentialVideo): TrackEntry {
+  return {
+    id: video.id,
+    title: video.title,
+    ...(typeof video.duration === "number"
+      ? { durationSeconds: video.duration }
+      : {}),
+  };
+}
+
+async function collectPaged<T>(
+  fetchPage: (page: number) => Promise<{ items: T[]; hasNext: boolean }>,
+  limit: number,
+): Promise<T[]> {
+  const collected: T[] = [];
+
+  for (let page = 1; collected.length < limit; page += 1) {
+    const { items, hasNext } = await fetchPage(page);
+
+    collected.push(...items);
+
+    if (!hasNext || items.length === 0) {
+      break;
+    }
+  }
+
+  return collected.slice(0, limit);
+}
+
+async function resolveResourceEntries(
+  resource: NiconicoResource,
+  auth: NicoAuth,
+  limit: number,
+  log?: NiconicoLogger,
+): Promise<TrackEntry[]> {
+  const client = getNiconicoClient(auth);
+
+  switch (resource.kind) {
+    case "video": {
+      const video = await client.videos.getVideo(resource.videoId);
+
+      return [
+        video
+          ? entryFromEssentialVideo(video)
+          : { id: resource.videoId, title: resource.videoId },
+      ];
+    }
+
+    case "mylist": {
+      const items = await collectPaged(async (page) => {
+        const detail = await client.mylists.getMylist(resource.mylistId, {
+          pageSize: PAGE_SIZE,
+          page,
+        });
+
+        return { items: detail.items, hasNext: detail.hasNext };
+      }, limit);
+
+      return items.map((item) => entryFromEssentialVideo(item.video));
+    }
+
+    case "series": {
+      const items = await collectPaged(async (page) => {
+        const result = await client.series.getSeries(resource.seriesId, {
+          pageSize: PAGE_SIZE,
+          page,
+        });
+
+        return {
+          items: result.items,
+          hasNext: page * PAGE_SIZE < result.totalCount,
+        };
+      }, limit);
+
+      return items.map((item) => entryFromEssentialVideo(item.video));
+    }
+
+    case "user": {
+      const items = await collectPaged(async (page) => {
+        const result = await client.users.getUserVideos(
+          Number(resource.userId),
+          { pageSize: PAGE_SIZE, page },
+        );
+
+        return {
+          items: result.items,
+          hasNext: page * PAGE_SIZE < result.totalCount,
+        };
+      }, limit);
+
+      return items.map(entryFromEssentialVideo);
+    }
+
+    case "ranking": {
+      const featuredKey = await resolveRankingGenreKey(
+        client,
+        resource.featuredKey,
+        log,
+      );
+      const result = await client.ranking.getRanking({
+        ...(featuredKey ? { featuredKey } : {}),
+        ...(resource.term ? { term: resource.term } : {}),
+        ...(resource.tag ? { tag: resource.tag } : {}),
+      });
+
+      return result.items.slice(0, limit).map(entryFromEssentialVideo);
+    }
+
+    case "tag": {
+      const result = await client.search.searchVideos({
+        tag: resource.tag,
+        pageSize: Math.min(limit, PAGE_SIZE),
+        sortKey: "registeredAt",
+        sortOrder: "desc",
+      });
+
+      return result.items.slice(0, limit).map(entryFromEssentialVideo);
+    }
+
+    case "search": {
+      const result = await client.search.searchVideos({
+        keyword: resource.keyword,
+        pageSize: Math.min(limit, PAGE_SIZE),
+        // "hot" is a relevance ranking: the API rejects it with an explicit
+        // sort direction, so the order must be left unset.
+        sortKey: "hot",
+        sortOrder: "none",
+      });
+
+      return result.items.slice(0, limit).map(entryFromEssentialVideo);
+    }
+
+    default:
+      return [];
+  }
+}
+
+function isTransientYtDlpError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message =
+    error instanceof YtDlpCommandError
+      ? error.stderr.toLowerCase()
+      : error.message.toLowerCase();
+
+  if (messageIncludesAny(message, ["enoent", "eacces"])) {
+    return false;
+  }
+
+  return messageIncludesAny(message, [
+    "http error 408",
+    "http error 429",
+    "http error 5",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "econnreset",
+    "etimedout",
+    "eai_again",
+  ]);
+}
+
+function messageIncludesAny(message: string, needles: string[]): boolean {
+  return needles.some((needle) => message.includes(needle));
+}
+
 async function runYtDlpJson(
   args: string[],
 ): Promise<Result<TrackEntry[], Error>> {
@@ -275,123 +715,12 @@ async function runYtDlpJson(
   return ok(entries);
 }
 
-function parseRetryAfterMs(response: Response): number | undefined {
-  const retryAfter = response.headers.get("retry-after");
-
-  if (!retryAfter) {
-    return undefined;
-  }
-
-  const seconds = Number.parseFloat(retryAfter);
-
-  if (Number.isFinite(seconds)) {
-    return Math.max(0, seconds * 1_000);
-  }
-
-  const date = Date.parse(retryAfter);
-
-  if (Number.isNaN(date)) {
-    return undefined;
-  }
-
-  return Math.max(0, date - Date.now());
-}
-
-function isTransientHttpStatus(status: number): boolean {
-  return status === 408 || status === 429 || status >= 500;
-}
-
-function messageIncludesAny(message: string, needles: string[]): boolean {
-  return needles.some((needle) => message.includes(needle));
-}
-
-function isTransientFetchError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-
-  const message = error.message.toLowerCase();
-
-  return (
-    error instanceof TypeError ||
-    messageIncludesAny(message, [
-      "fetch failed",
-      "network",
-      "timeout",
-      "timed out",
-      "connection reset",
-      "econnreset",
-      "etimedout",
-      "eai_again",
-    ])
-  );
-}
-
-function isTransientYtDlpError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-
-  const message =
-    error instanceof YtDlpCommandError
-      ? error.stderr.toLowerCase()
-      : error.message.toLowerCase();
-
-  if (messageIncludesAny(message, ["enoent", "eacces"])) {
-    return false;
-  }
-
-  return messageIncludesAny(message, [
-    "http error 408",
-    "http error 429",
-    "http error 5",
-    "timed out",
-    "timeout",
-    "temporarily unavailable",
-    "connection reset",
-    "econnreset",
-    "etimedout",
-    "eai_again",
-  ]);
-}
-
-async function fetchTagSearchResponse(
-  url: URL,
-  retryOptions: RetryOptions,
-): Promise<Response> {
-  return withRetry(
-    async () => {
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent": "NicomusicBotCLI/0.1.0",
-        },
-      });
-
-      if (isTransientHttpStatus(response.status)) {
-        throw new RetriableHttpError(
-          response.status,
-          parseRetryAfterMs(response),
-        );
-      }
-
-      return response;
-    },
-    {
-      attempts: 3,
-      ...retryOptions,
-      shouldRetry:
-        retryOptions.shouldRetry ??
-        ((error) =>
-          error instanceof RetriableHttpError || isTransientFetchError(error)),
-      getDelayMs:
-        retryOptions.getDelayMs ??
-        ((error) =>
-          error instanceof RetriableHttpError ? error.retryAfterMs : undefined),
-    },
-  );
-}
-
-export async function fetchEntries(
+/**
+ * yt-dlp fallback for anything the native client cannot resolve. Kept because
+ * it still understands channel pages and other one-off URL shapes that the
+ * public nvapi endpoints do not cover.
+ */
+export async function fetchEntriesWithYtDlp(
   url: string,
   auth: NicoAuth,
 ): Promise<TrackEntry[]> {
@@ -416,6 +745,178 @@ export async function fetchEntries(
   return entriesResult.value;
 }
 
+/**
+ * Resolve a pasted link into a playable queue. Tries the native nvapi client
+ * first and only shells out to yt-dlp when that cannot answer, so the common
+ * path needs no external binary at all.
+ */
+export async function fetchEntries(
+  url: string,
+  auth: NicoAuth,
+  options: { limit?: number; log?: NiconicoLogger } = {},
+): Promise<TrackEntry[]> {
+  const limit = options.limit ?? COLLECTION_LIMIT;
+  const resource = classifyNiconicoUrl(url);
+  let nativeError: unknown;
+
+  if (resource.kind !== "unknown") {
+    try {
+      const entries = await resolveResourceEntries(
+        resource,
+        auth,
+        limit,
+        options.log,
+      );
+
+      if (entries.length > 0) {
+        return entries;
+      }
+
+      options.log?.(
+        "info",
+        `NicoNico returned no ${resource.kind} entries for "${url}"; trying yt-dlp.`,
+      );
+    } catch (error) {
+      nativeError = error;
+      options.log?.(
+        "warn",
+        `Native ${resource.kind} lookup failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
+      );
+    }
+  }
+
+  try {
+    return await fetchEntriesWithYtDlp(url, auth);
+  } catch (fallbackError) {
+    if (nativeError === undefined) {
+      throw fallbackError;
+    }
+
+    // Report both halves: only the dashboard sees the warning above, so
+    // without this the user is told yt-dlp failed and never learns why
+    // NicoNico did — which is usually the actionable half.
+    throw new Error(
+      `NicoNico ${resource.kind} lookup failed (${normalizeErrorMessage(nativeError)}) and the yt-dlp fallback failed (${normalizeErrorMessage(fallbackError)}).`,
+      { cause: fallbackError },
+    );
+  }
+}
+
+export type NativeAudioStream = {
+  videoId: string;
+  title: string;
+  durationSeconds: number;
+  /** Signed, audio-only HLS playlist URL. */
+  contentUrl: string;
+  /** Origin/Referer/Cookie headers the CDN requires. */
+  headers: Record<string, string>;
+  audioStreamId: string;
+  audioBitRate: number;
+  expireTime?: string;
+};
+
+async function fetchWatchData(
+  client: NiconicoClient,
+  videoId: string,
+): Promise<WatchResult> {
+  if (!client.isLoggedIn()) {
+    return client.watch.getGuestWatchData(videoId);
+  }
+
+  try {
+    return await client.watch.getWatchData(videoId);
+  } catch (error) {
+    // An expired or rejected session should degrade to guest access rather
+    // than failing the track outright; guest still plays most public videos.
+    if (
+      isNiconicoApiError(error) &&
+      (error.isUnauthorized() || error.status === 403)
+    ) {
+      return client.watch.getGuestWatchData(videoId);
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * Resolve a track straight to an audio-only HLS playlist through the DMS
+ * (Domand) API. Requesting no video stream means the CDN serves a playlist
+ * carrying only the AAC rendition, so playback pulls a fraction of the bytes a
+ * full A/V download would.
+ */
+export async function resolveNativeAudioStream(
+  entry: TrackEntry,
+  auth: NicoAuth,
+): Promise<NativeAudioStream> {
+  const source = entry.id ?? entry.url ?? entry.webpageUrl;
+
+  if (!source) {
+    throw new Error("Track has no NicoNico identifier to resolve.");
+  }
+
+  const resource = classifyNiconicoUrl(source);
+
+  if (resource.kind !== "video") {
+    throw new Error(`"${source}" is not a NicoNico video reference.`);
+  }
+
+  const client = getNiconicoClient(auth);
+  const watch = await fetchWatchData(client, resource.videoId);
+  const domand = watch.data.media?.domand;
+
+  if (!domand) {
+    throw new NiconicoUnplayableError(
+      resource.videoId,
+      `no DMS stream (okReason=${watch.data.okReason})`,
+    );
+  }
+
+  if (!domand.accessRightKey) {
+    throw new NiconicoUnplayableError(
+      resource.videoId,
+      "no access right key — the video may need a paid or channel membership",
+    );
+  }
+
+  const audio = pickBestAudio(domand);
+
+  if (!audio) {
+    throw new NiconicoUnplayableError(
+      resource.videoId,
+      "no available audio rendition",
+    );
+  }
+
+  try {
+    // Deliberately omit videoStreamId: that makes the access-rights request
+    // ask for `outputs: [[audio]]`, i.e. an audio-only playlist.
+    const hls = await client.streaming.createHlsAccessRights({
+      videoId: watch.data.video.id,
+      accessRightKey: domand.accessRightKey,
+      actionTrackId: watch.actionTrackId,
+      audioStreamId: audio.id,
+    });
+
+    return {
+      videoId: watch.data.video.id,
+      title: watch.data.video.title,
+      durationSeconds: watch.data.video.duration,
+      contentUrl: hls.contentUrl,
+      headers: domandRequestHeaders(hls),
+      audioStreamId: audio.id,
+      audioBitRate: audio.bitRate,
+      ...(hls.expireTime ? { expireTime: hls.expireTime } : {}),
+    };
+  } catch (error) {
+    if (error instanceof DomandUnavailableError) {
+      throw new NiconicoUnplayableError(resource.videoId, error.message);
+    }
+
+    throw error;
+  }
+}
+
 export async function resolveTrackTitle(
   entry: TrackEntry,
   auth: NicoAuth,
@@ -428,6 +929,22 @@ export async function resolveTrackTitle(
 
   if (!url) {
     return entry.title;
+  }
+
+  const resource = classifyNiconicoUrl(url);
+
+  if (resource.kind === "video") {
+    try {
+      const video = await getNiconicoClient(auth).videos.getVideo(
+        resource.videoId,
+      );
+
+      if (video?.title) {
+        return video.title;
+      }
+    } catch {
+      // Fall through to yt-dlp below.
+    }
   }
 
   const metadataResult = await runYtDlpJson([
@@ -454,11 +971,7 @@ function extractTagFromInput(input: string): string {
 
   const tagPath = cleaned.split("/tag/", 2)[1]?.split("?", 1)[0] ?? cleaned;
 
-  try {
-    return decodeURIComponent(tagPath);
-  } catch {
-    return tagPath;
-  }
+  return decodeSegment(tagPath);
 }
 
 export function parseTagRequest(raw: string): { tag: string; limit: number } {
@@ -480,61 +993,39 @@ export function parseTagRequest(raw: string): { tag: string; limit: number } {
   };
 }
 
+/**
+ * Tag search through the snapshot API. The client retries transient failures
+ * itself with jittered backoff and honours `Retry-After`, so there is no
+ * second retry layer here.
+ */
 export async function searchByTag(
   tagInput: string,
   limit: number,
-  retryOptions: RetryOptions = {},
+  auth: NicoAuth = {},
 ): Promise<TrackEntry[]> {
   const tag = extractTagFromInput(tagInput);
-  const url = new URL(
-    "https://snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search",
-  );
+  const client = getNiconicoClient(auth);
+  const cappedLimit = Math.max(1, Math.min(limit, 100));
 
-  url.search = new URLSearchParams({
-    q: tag,
-    targets: "tags",
-    fields: "contentId,title",
-    _sort: "-startTime",
-    _limit: String(Math.max(1, Math.min(limit, 100))),
-    _context: "NicomusicBotCLI",
-  }).toString();
-
-  const responseResult = await fromPromise(
-    fetchTagSearchResponse(url, retryOptions),
+  const result = await fromPromise(
+    client.snapshot.search({
+      q: tag,
+      targets: ["tags"],
+      fields: ["contentId", "title", "lengthSeconds"],
+      sort: "startTime",
+      order: "desc",
+      limit: cappedLimit,
+      context: "NicomusicBotCLI",
+    }),
     (error) =>
       new Error(`Tag search request failed: ${normalizeErrorMessage(error)}`),
   );
 
-  if (responseResult.isErr()) {
-    throw responseResult.error;
+  if (result.isErr()) {
+    throw result.error;
   }
 
-  const response = responseResult.value;
-
-  if (!response.ok) {
-    throw new Error(`Tag search API returned ${response.status}.`);
-  }
-
-  const jsonResult = await fromPromise(
-    response.json(),
-    (error) =>
-      new Error(
-        `Failed to decode tag search response: ${normalizeErrorMessage(error)}`,
-      ),
-  );
-
-  if (jsonResult.isErr()) {
-    throw jsonResult.error;
-  }
-
-  const data = jsonResult.value as {
-    data?: Array<{
-      contentId?: string;
-      title?: string;
-    }>;
-  };
-
-  return (data.data ?? []).flatMap((item) => {
+  return result.value.data.flatMap((item) => {
     if (!item.contentId) {
       return [];
     }
@@ -543,7 +1034,28 @@ export async function searchByTag(
       {
         id: item.contentId,
         title: item.title ?? item.contentId,
+        ...(typeof item.lengthSeconds === "number"
+          ? { durationSeconds: item.lengthSeconds }
+          : {}),
       } satisfies TrackEntry,
     ];
   });
+}
+
+/**
+ * Confirm the configured session is live. Returns the account nickname so the
+ * dashboard can show which NicoNico user the bot is acting as.
+ */
+export async function verifyNiconicoSession(
+  auth: NicoAuth,
+): Promise<{ nickname: string; isPremium: boolean } | undefined> {
+  const client = getNiconicoClient(auth);
+
+  if (!client.isLoggedIn()) {
+    return undefined;
+  }
+
+  const user = await client.auth.verifySession();
+
+  return { nickname: user.nickname, isPremium: user.isPremium };
 }

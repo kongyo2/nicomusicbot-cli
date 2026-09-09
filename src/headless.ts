@@ -108,9 +108,13 @@ async function resolveDependencyChecks(
     checks: DependencyCheck[],
   ) => Promise<DependencySetupResult>,
 ): Promise<DependencyCheck[]> {
-  const missingRequired = checks.filter((check) => check.required && !check.ok);
+  // Install anything installable that is missing, not just the blockers:
+  // yt-dlp is optional now but still worth having as a fallback.
+  const missingInstallable = checks.filter(
+    (check) => check.autoInstall === true && !check.ok,
+  );
 
-  if (missingRequired.length === 0) {
+  if (missingInstallable.length === 0) {
     return checks;
   }
 

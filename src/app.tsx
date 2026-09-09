@@ -358,18 +358,20 @@ export function App({
         label: "Checking external dependencies",
         value: 20,
       });
-      nextStore.addLog("info", "Checking yt-dlp, ffmpeg, and Opus backend...");
+      nextStore.addLog("info", "Checking ffmpeg, yt-dlp, and Opus backend...");
 
       let checks = await checkPrerequisites();
 
-      const missingRequired = checks.filter(
-        (check) => check.required && !check.ok,
+      // Install anything installable that is missing, not just the blockers:
+      // yt-dlp is optional now but still worth having as a fallback.
+      const missingInstallable = checks.filter(
+        (check) => check.autoInstall === true && !check.ok,
       );
 
-      if (missingRequired.length > 0) {
+      if (missingInstallable.length > 0) {
         nextStore.addLog(
           "warn",
-          `Missing required dependencies detected: ${missingRequired
+          `Missing dependencies detected: ${missingInstallable
             .map((check) => check.command)
             .join(", ")}. Trying automatic setup...`,
         );

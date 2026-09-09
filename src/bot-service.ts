@@ -36,8 +36,12 @@ import {
   makeTrackUrl,
   normalizeNiconicoUrl,
   parseTagRequest,
+  resolveNativeAudioStream,
   resolveTrackTitle,
   searchByTag,
+  verifyNiconicoSession,
+  type NativeAudioStream,
+  type NicoAuth,
 } from "./niconico.js";
 import { sleep } from "./retry.js";
 import { RuntimeStore } from "./runtime-store.js";
@@ -85,6 +89,45 @@ async function sendWithRetry(
       return;
     }
   }
+}
+
+/**
+ * Resolve once the child process is actually running, and reject when the
+ * binary is missing. `spawn()` surfaces ENOENT asynchronously, so without this
+ * a caller sees healthy stdio streams, announces the track, and then hits EOF
+ * and skips it with nothing said in the channel.
+ */
+export async function waitForSpawn(
+  child: ChildProcess,
+  command: string,
+): Promise<void> {
+  try {
+    await once(child, "spawn");
+  } catch (error) {
+    throw new Error(
+      `Could not start ${command}: ${normalizeErrorMessage(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+/** Keep only the tail of a child's stderr; enough to explain an exit code. */
+const STDERR_TAIL_LIMIT = 2_000;
+
+/**
+ * Consume a child's stderr and return a getter for its tail. Spawning with a
+ * piped stderr that nothing reads risks filling the pipe buffer and blocking
+ * the child, so this is about liveness as much as diagnostics.
+ */
+export function drainStderr(child: ChildProcess): () => string {
+  let buffered = "";
+
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    buffered = `${buffered}${chunk}`.slice(-STDERR_TAIL_LIMIT);
+  });
+
+  return () => buffered;
 }
 
 async function commandExists(command: string): Promise<boolean> {
@@ -207,7 +250,7 @@ export async function autoSetupPrerequisites(
 ): Promise<DependencySetupResult> {
   const missingCommands = new Set(
     checks
-      .filter((check) => !check.ok && check.required)
+      .filter((check) => !check.ok && check.autoInstall === true)
       .map((check) => check.command),
   );
 
@@ -324,8 +367,13 @@ export async function checkPrerequisites(): Promise<DependencyCheck[]> {
       name: "yt-dlp",
       command: "yt-dlp",
       ok: checks[0],
-      details: checks[0] ? "Found in PATH." : "Not found in PATH.",
-      required: true,
+      details: checks[0]
+        ? "Found in PATH."
+        : "Not found in PATH. Only needed as a fallback; NicoNico playback uses the built-in client.",
+      // No longer required: @kongyo2/niconicojs resolves streams natively and
+      // yt-dlp is consulted only when that fails.
+      required: false,
+      autoInstall: true,
     },
     {
       name: "ffmpeg",
@@ -333,6 +381,7 @@ export async function checkPrerequisites(): Promise<DependencyCheck[]> {
       ok: checks[1],
       details: checks[1] ? "Found in PATH." : "Not found in PATH.",
       required: true,
+      autoInstall: true,
     },
     {
       name: "opus backend",
@@ -793,59 +842,121 @@ class GuildController {
         continue;
       }
 
+      const { stream: native, error: nativeError } =
+        await this.resolveNativeStream(next);
+      let ytDlpStderr: (() => string) | undefined;
+
       try {
         const title =
+          native?.title ??
           (await resolveTrackTitle(next, this.service.niconicoAuth())) ??
           next.title ??
           next.id ??
           "Unknown";
-        const ytDlp = this.spawnYtDlp(url);
-        const ffmpeg = this.spawnFfmpeg();
+        const ffmpeg = native
+          ? this.spawnFfmpegFromUrl(native)
+          : this.spawnFfmpegFromPipe();
 
-        if (!ytDlp.stdout || !ffmpeg.stdin || !ffmpeg.stdout) {
+        // Track it before anything below can throw. Everything after this
+        // point — the stdout check, the spawn wait, the whole yt-dlp branch —
+        // can fail, and cleanupProcesses() can only kill what it can see.
+        // An ffmpeg reading pipe:0 that nobody writes to never exits on its
+        // own, so an untracked one would hang around per failed track.
+        this.ffmpegProcess = ffmpeg;
+
+        if (!ffmpeg.stdout) {
           throw new Error("Audio pipeline could not be created.");
         }
 
-        ytDlp.stdout.pipe(ffmpeg.stdin);
-        ytDlp.on("close", (code) => {
-          ffmpeg.stdin?.end();
-
-          // A non-zero exit while this track is still current means the stream
-          // ended early. Surface it so the truncation is diagnosable instead of
-          // silently looking like a normal end-of-track.
-          if (code && code !== 0 && this.current?.id === next.id) {
-            this.service.log(
-              "warn",
-              `[${this.guild.name}] yt-dlp exited with code ${code} during "${title}"; the stream may have been cut short.`,
-            );
-          }
-        });
-
-        this.ytDlpProcess = ytDlp;
-        this.ffmpegProcess = ffmpeg;
-
-        ytDlp.on("error", (error) => {
-          this.service.log(
-            "error",
-            `[${this.guild.name}] yt-dlp process error: ${error.message}`,
-          );
-        });
         ffmpeg.on("error", (error) => {
           this.service.log(
             "error",
             `[${this.guild.name}] ffmpeg process error: ${error.message}`,
           );
         });
-        ffmpeg.stdin.on("error", (error) => {
-          if ("code" in error && error.code === "EPIPE") {
+
+        // stderr is a pipe nobody reads otherwise: drain it so a chatty
+        // failure cannot fill the buffer and wedge ffmpeg, and keep the tail
+        // to explain a nonzero exit.
+        const ffmpegStderr = drainStderr(ffmpeg);
+
+        // A failure after a clean start (an expired playlist, an HTTP error
+        // from the CDN) arrives as "close", not "error". Its stdout just hits
+        // EOF, which the player reads as a finished track, so without this the
+        // channel sees "Now playing" and then silence.
+        ffmpeg.on("close", (code) => {
+          // Skip and stop kill the process, and ffmpeg handles SIGTERM itself
+          // rather than dying from it — measured, that surfaces as 255, or 0,
+          // or null with a signal depending on how far it had got. Only
+          // `killed` reliably separates that from a genuine failure.
+          if (code === 0 || ffmpeg.killed || this.current?.id !== next.id) {
             return;
           }
 
+          const details = ffmpegStderr().trim() || "no stderr output";
           this.service.log(
-            "warn",
-            `[${this.guild.name}] ffmpeg stdin error: ${error.message}`,
+            "error",
+            `[${this.guild.name}] ffmpeg exited with code ${code} during "${title}": ${details}`,
+          );
+          void this.notify(
+            `Playback of ${title} stopped: ffmpeg exited with code ${code}.`,
           );
         });
+
+        // spawn() reports a missing binary asynchronously via an "error"
+        // event, long after the stdio streams look healthy. Without this the
+        // track would be announced as playing and then silently skipped.
+        await waitForSpawn(ffmpeg, "ffmpeg");
+
+        if (!native) {
+          const ytDlp = this.spawnYtDlp(url);
+
+          // Same reasoning as ffmpeg above: track first, then validate.
+          this.ytDlpProcess = ytDlp;
+
+          if (!ytDlp.stdout || !ffmpeg.stdin) {
+            throw new Error("Audio pipeline could not be created.");
+          }
+
+          ytDlp.on("error", (error) => {
+            this.service.log(
+              "error",
+              `[${this.guild.name}] yt-dlp process error: ${error.message}`,
+            );
+          });
+
+          // Same unread pipe as ffmpeg's, and yt-dlp is the noisier of the two.
+          ytDlpStderr = drainStderr(ytDlp);
+
+          // yt-dlp is optional now, so a machine without it reaches here.
+          await waitForSpawn(ytDlp, "yt-dlp");
+
+          ytDlp.stdout.pipe(ffmpeg.stdin);
+          ytDlp.on("close", (code) => {
+            ffmpeg.stdin?.end();
+
+            // A non-zero exit while this track is still current means the
+            // stream ended early. Surface it so the truncation is diagnosable
+            // instead of silently looking like a normal end-of-track.
+            if (code && code !== 0 && this.current?.id === next.id) {
+              const details = ytDlpStderr?.().trim() || "no stderr output";
+              this.service.log(
+                "warn",
+                `[${this.guild.name}] yt-dlp exited with code ${code} during "${title}"; the stream may have been cut short: ${details}`,
+              );
+            }
+          });
+          ffmpeg.stdin.on("error", (error) => {
+            if ("code" in error && error.code === "EPIPE") {
+              return;
+            }
+
+            this.service.log(
+              "warn",
+              `[${this.guild.name}] ffmpeg stdin error: ${error.message}`,
+            );
+          });
+        }
 
         const resource = createAudioResource(ffmpeg.stdout, {
           inputType: StreamType.Raw,
@@ -870,7 +981,12 @@ class GuildController {
         await this.notify(`Now playing: ${title}\n${url}`);
         return;
       } catch (error) {
-        this.lastError = normalizeErrorMessage(error);
+        // The native failure is the actionable half when the fallback dies
+        // too, and it would otherwise only ever reach the dashboard log.
+        this.lastError =
+          nativeError === undefined
+            ? normalizeErrorMessage(error)
+            : `NicoNico playback failed (${normalizeErrorMessage(nativeError)}) and the yt-dlp fallback failed (${normalizeErrorMessage(error)})`;
         this.playbackStatus = "error";
         this.updateSnapshot();
         this.service.log(
@@ -931,7 +1047,90 @@ class GuildController {
     );
   }
 
-  private spawnFfmpeg(): ChildProcess {
+  /**
+   * Ask NicoNico's DMS API for an audio-only HLS playlist. Returns undefined
+   * when the native path cannot serve the track, which sends the caller down
+   * the yt-dlp fallback.
+   */
+  private async resolveNativeStream(
+    entry: TrackEntry,
+  ): Promise<{ stream?: NativeAudioStream; error?: unknown }> {
+    try {
+      const stream = await resolveNativeAudioStream(
+        entry,
+        this.service.niconicoAuth(),
+      );
+
+      this.service.log(
+        "info",
+        `[${this.guild.name}] Resolved "${stream.title}" via NicoNico DMS (${Math.round(stream.audioBitRate / 1000)} kbps audio-only).`,
+      );
+
+      return { stream };
+    } catch (error) {
+      this.service.log(
+        "warn",
+        `[${this.guild.name}] Native stream resolution failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
+      );
+
+      // Hand the error back rather than swallowing it: only the dashboard
+      // sees the warning above, and if the fallback fails too this is the
+      // half that explains why (membership required, deleted, and so on).
+      return { error };
+    }
+  }
+
+  /**
+   * Decode a signed HLS playlist straight to PCM. ffmpeg fetches the segments
+   * itself, so there is no second process in the pipeline at all.
+   */
+  private spawnFfmpegFromUrl(stream: NativeAudioStream): ChildProcess {
+    const headerLines = Object.entries(stream.headers)
+      .map(([name, value]) => `${name}: ${value}\r\n`)
+      .join("");
+
+    return spawn(
+      "ffmpeg",
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        // The CDN rejects requests without the Domand cookie and origin.
+        "-headers",
+        headerLines,
+        // A dropped segment fetch used to end the track early; reconnect
+        // instead so a network glitch costs seconds, not the rest of the song.
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_on_http_error",
+        "4xx,5xx",
+        "-reconnect_delay_max",
+        "30",
+        "-rw_timeout",
+        "30000000",
+        "-i",
+        stream.contentUrl,
+        "-vn",
+        "-f",
+        "s16le",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "pipe:1",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
+  }
+
+  private spawnFfmpegFromPipe(): ChildProcess {
     return spawn(
       "ffmpeg",
       [
@@ -983,18 +1182,16 @@ export class NicomusicBotService {
   }
 
   /**
-   * Auth object passed to the metadata helpers in niconico.ts. Prefers the
-   * `user_session` cookie because password login is unreliable (2FA and the
-   * broken yt-dlp login flow), falling back to username/password.
+   * Auth object passed to the helpers in niconico.ts. The raw `user_session`
+   * drives the native client; the cookies.txt path and username/password only
+   * matter to the yt-dlp fallback, where password login is unreliable anyway
+   * (2FA and the broken yt-dlp login flow).
    */
-  niconicoAuth(): {
-    niconicoUser?: string;
-    niconicoPassword?: string;
-    cookiesPath?: string;
-  } {
+  niconicoAuth(): NicoAuth {
     return {
       niconicoUser: this.config.niconicoUser,
       niconicoPassword: this.config.niconicoPassword,
+      niconicoSession: this.config.niconicoSession,
       cookiesPath: this.cookiesPath,
     };
   }
@@ -1042,6 +1239,44 @@ export class NicomusicBotService {
     }
   }
 
+  /**
+   * Confirm the NicoNico session before Discord login so an expired cookie
+   * shows up as one clear startup warning instead of a failure on every track.
+   */
+  private async verifySession(): Promise<void> {
+    if (!this.config.niconicoSession) {
+      this.log(
+        "info",
+        "No NicoNico session configured; playback runs as a guest.",
+      );
+      return;
+    }
+
+    try {
+      const user = await verifyNiconicoSession(this.niconicoAuth());
+
+      if (user) {
+        this.log(
+          "success",
+          `NicoNico session verified as ${user.nickname}${user.isPremium ? " (premium)" : ""}.`,
+        );
+      } else {
+        // A session was configured but did not parse into a usable cookie
+        // value, so the client never logged in. Say so rather than starting
+        // up silently as a guest.
+        this.log(
+          "warn",
+          "The configured NicoNico session could not be used; playback runs as a guest.",
+        );
+      }
+    } catch (error) {
+      this.log(
+        "warn",
+        `NicoNico session check failed (${normalizeErrorMessage(error)}); continuing as a guest.`,
+      );
+    }
+  }
+
   private async cleanupCookieFile(): Promise<void> {
     const dir = this.cookiesDir;
     this.cookiesPath = undefined;
@@ -1066,6 +1301,7 @@ export class NicomusicBotService {
     });
     this.log("info", "Preparing Discord client...");
     await this.ensureCookieFile();
+    await this.verifySession();
     await this.waitForDiscordApi();
 
     const client = new Client({
@@ -1241,6 +1477,7 @@ export class NicomusicBotService {
     const entries = await fetchEntries(
       normalizeNiconicoUrl(rest),
       this.niconicoAuth(),
+      { log: (level, text) => this.log(level, text) },
     );
 
     if (entries.length === 0) {
@@ -1291,7 +1528,7 @@ export class NicomusicBotService {
       channel,
       `Searching NicoNico tag "${tag}" (limit ${limit})...`,
     );
-    const entries = await searchByTag(tag, limit);
+    const entries = await searchByTag(tag, limit, this.niconicoAuth());
 
     if (entries.length === 0) {
       await sendWithRetry(channel, "No tracks were found for that tag.");
