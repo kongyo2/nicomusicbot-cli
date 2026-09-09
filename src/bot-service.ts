@@ -835,6 +835,13 @@ class GuildController {
           ? this.spawnFfmpegFromUrl(native)
           : this.spawnFfmpegFromPipe();
 
+        // Track it before anything below can throw. Everything after this
+        // point — the stdout check, the spawn wait, the whole yt-dlp branch —
+        // can fail, and cleanupProcesses() can only kill what it can see.
+        // An ffmpeg reading pipe:0 that nobody writes to never exits on its
+        // own, so an untracked one would hang around per failed track.
+        this.ffmpegProcess = ffmpeg;
+
         if (!ffmpeg.stdout) {
           throw new Error("Audio pipeline could not be created.");
         }
@@ -853,6 +860,9 @@ class GuildController {
 
         if (!native) {
           const ytDlp = this.spawnYtDlp(url);
+
+          // Same reasoning as ffmpeg above: track first, then validate.
+          this.ytDlpProcess = ytDlp;
 
           if (!ytDlp.stdout || !ffmpeg.stdin) {
             throw new Error("Audio pipeline could not be created.");
@@ -892,11 +902,7 @@ class GuildController {
               `[${this.guild.name}] ffmpeg stdin error: ${error.message}`,
             );
           });
-
-          this.ytDlpProcess = ytDlp;
         }
-
-        this.ffmpegProcess = ffmpeg;
 
         const resource = createAudioResource(ffmpeg.stdout, {
           inputType: StreamType.Raw,
