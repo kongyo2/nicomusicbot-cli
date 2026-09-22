@@ -29,6 +29,8 @@ import {
   NicomusicBotService,
   autoSetupPrerequisites,
   checkPrerequisites,
+  describeMissingDependencies,
+  findMissingInstallable,
 } from "./bot-service.js";
 import { RuntimeStore } from "./runtime-store.js";
 import { normalizeErrorMessage } from "./errors.js";
@@ -94,15 +96,25 @@ type ScreenHandlers = {
   goToPostEditStage: (draft: ConfigDraft) => void;
 };
 
-// Shared props for the single-field setup screens (token, prefix, NicoNico
-// user/password/session). Each renders a FieldScreen with one text/password
-// input and drives the draft through the setup flow via these handlers.
+type FieldStage = Extract<Stage, keyof ConfigDraft>;
+
 type InputScreenProps = {
+  stage: FieldStage;
   headerProps: HeaderProps;
   draft: ConfigDraft;
   validationIssues: string[];
   handlers: ScreenHandlers;
 };
+
+type SetupField = {
+  title: string;
+  describe: (draft: ConfigDraft) => React.ReactNode;
+  placeholder: (draft: ConfigDraft) => string;
+  submit: (value: string, draft: ConfigDraft, handlers: ScreenHandlers) => void;
+} & (
+  | { secret: true }
+  | { secret: false; defaultValue: (draft: ConfigDraft) => string }
+);
 
 function getInitialStage(
   autoStart: boolean,
@@ -337,6 +349,16 @@ export function App({
       store: nextStore,
     });
 
+    const failStartup = (message: string) => {
+      nextStore.setStatus("error", message);
+      nextStore.setProgress(undefined);
+      nextStore.addLog("error", message);
+      dispatch({
+        type: "startupFailed",
+        message,
+      });
+    };
+
     const run = async () => {
       const issues = validateDraft(state.draft);
 
@@ -362,11 +384,7 @@ export function App({
 
       let checks = await checkPrerequisites();
 
-      // Install anything installable that is missing, not just the blockers:
-      // yt-dlp is optional now but still worth having as a fallback.
-      const missingInstallable = checks.filter(
-        (check) => check.autoInstall === true && !check.ok,
-      );
+      const missingInstallable = findMissingInstallable(checks);
 
       if (missingInstallable.length > 0) {
         nextStore.addLog(
@@ -397,8 +415,6 @@ export function App({
       });
       nextStore.setDependencies(checks);
 
-      const missing = checks.filter((check) => !check.ok && check.required);
-
       const optionalMissing = checks.filter(
         (check) => !check.ok && !check.required,
       );
@@ -410,18 +426,10 @@ export function App({
         );
       }
 
-      if (missing.length > 0) {
-        const message = `Missing dependencies: ${missing
-          .map((check) => check.command)
-          .join(", ")}`;
+      const missingMessage = describeMissingDependencies(checks);
 
-        nextStore.setStatus("error", message);
-        nextStore.setProgress(undefined);
-        nextStore.addLog("error", message);
-        dispatch({
-          type: "startupFailed",
-          message,
-        });
+      if (missingMessage) {
+        failStartup(missingMessage);
         return;
       }
 
@@ -457,15 +465,7 @@ export function App({
     };
 
     run().catch((error) => {
-      const message = normalizeErrorMessage(error);
-
-      nextStore.setStatus("error", message);
-      nextStore.setProgress(undefined);
-      nextStore.addLog("error", message);
-      dispatch({
-        type: "startupFailed",
-        message,
-      });
+      failStartup(normalizeErrorMessage(error));
     });
 
     return () => {
@@ -533,44 +533,14 @@ export function App({
 
   switch (state.stage) {
     case "token":
-      return (
-        <TokenScreen
-          headerProps={headerProps}
-          draft={state.draft}
-          validationIssues={state.validationIssues}
-          handlers={handlers}
-        />
-      );
     case "prefix":
-      return (
-        <PrefixScreen
-          headerProps={headerProps}
-          draft={state.draft}
-          validationIssues={state.validationIssues}
-          handlers={handlers}
-        />
-      );
     case "niconicoUser":
-      return (
-        <NiconicoUserScreen
-          headerProps={headerProps}
-          draft={state.draft}
-          validationIssues={state.validationIssues}
-          handlers={handlers}
-        />
-      );
     case "niconicoPassword":
-      return (
-        <NiconicoPasswordScreen
-          headerProps={headerProps}
-          draft={state.draft}
-          validationIssues={state.validationIssues}
-          handlers={handlers}
-        />
-      );
     case "niconicoSession":
       return (
-        <NiconicoSessionScreen
+        <SetupFieldScreen
+          key={state.stage}
+          stage={state.stage}
           headerProps={headerProps}
           draft={state.draft}
           validationIssues={state.validationIssues}
@@ -683,210 +653,168 @@ function FieldScreen({
   );
 }
 
-function TokenScreen({
-  headerProps,
-  draft,
-  validationIssues,
-  handlers,
-}: InputScreenProps) {
-  return (
-    <FieldScreen
-      headerProps={headerProps}
-      title="Discord bot token"
-      description={
-        draft.token
-          ? `Current token: ${maskSecret(draft.token)}`
-          : "No token configured yet."
+function submitRequiredField(field: {
+  stage: Extract<FieldStage, "token" | "prefix" | "niconicoPassword">;
+  nextStage: Stage;
+  issue: string;
+  trimInput: boolean;
+  keepCurrent: boolean;
+}): SetupField["submit"] {
+  return (value, draft, handlers) => {
+    const typed = field.trimInput ? value.trim() : value;
+    const next = field.keepCurrent ? typed || draft[field.stage] : typed;
+
+    if (!next.trim()) {
+      handlers.failValidation([field.issue], field.stage);
+      return;
+    }
+
+    handlers.commitDraft({
+      ...draft,
+      [field.stage]: next,
+    });
+    handlers.goToStage(field.nextStage);
+  };
+}
+
+const SETUP_FIELDS: Record<FieldStage, SetupField> = {
+  token: {
+    title: "Discord bot token",
+    describe: (draft) =>
+      draft.token
+        ? `Current token: ${maskSecret(draft.token)}`
+        : "No token configured yet.",
+    secret: true,
+    placeholder: (draft) =>
+      draft.token
+        ? "Press Enter to keep the current token"
+        : "Paste Discord bot token",
+    submit: submitRequiredField({
+      stage: "token",
+      nextStage: "prefix",
+      issue: "Discord token is required.",
+      trimInput: true,
+      keepCurrent: true,
+    }),
+  },
+  prefix: {
+    title: "Command prefix",
+    describe: () => "Examples: `!`, `?`, `!!`",
+    secret: false,
+    placeholder: () => "!",
+    defaultValue: (draft) => draft.prefix,
+    submit: submitRequiredField({
+      stage: "prefix",
+      nextStage: "niconicoUser",
+      issue: "Command prefix is required.",
+      trimInput: true,
+      keepCurrent: false,
+    }),
+  },
+  niconicoUser: {
+    title: "NicoNico username or email",
+    describe: () => "Leave empty to run without NicoNico account credentials.",
+    secret: false,
+    placeholder: () => "Optional",
+    defaultValue: (draft) => draft.niconicoUser,
+    submit: (value, draft, handlers) => {
+      const nextUser = value.trim();
+
+      if (!nextUser) {
+        handlers.commitDraft({
+          ...draft,
+          niconicoUser: "",
+          niconicoPassword: "",
+        });
+        handlers.goToStage("niconicoSession");
+        return;
       }
-      validationIssues={validationIssues}
-    >
-      <PasswordInput
-        placeholder={
-          draft.token
-            ? "Press Enter to keep the current token"
-            : "Paste Discord bot token"
-        }
-        onSubmit={(value) => {
-          const nextToken = value.trim() || draft.token;
 
-          if (!nextToken.trim()) {
-            handlers.failValidation(["Discord token is required."], "token");
-            return;
-          }
+      handlers.commitDraft({
+        ...draft,
+        niconicoUser: nextUser,
+      });
+      handlers.goToStage("niconicoPassword");
+    },
+  },
+  niconicoPassword: {
+    title: "NicoNico password",
+    describe: (draft) =>
+      draft.niconicoPassword
+        ? "Press Enter to keep the current password."
+        : "Required only when using a NicoNico account.",
+    secret: true,
+    placeholder: (draft) =>
+      draft.niconicoPassword
+        ? "Press Enter to keep the current password"
+        : "Enter NicoNico password",
+    submit: submitRequiredField({
+      stage: "niconicoPassword",
+      nextStage: "niconicoSession",
+      issue: "NicoNico password is required when a NicoNico user is set.",
+      trimInput: false,
+      keepCurrent: true,
+    }),
+  },
+  niconicoSession: {
+    title: "NicoNico session cookie",
+    describe: (draft) => (
+      <>
+        Paste the `user_session` cookie value from a logged-in browser. This is
+        the most reliable login (it survives 2FA) and helps avoid mid-playback
+        stops on restricted videos.
+        {draft.niconicoSession
+          ? ' Press Enter to keep it, or type "-" to remove it.'
+          : " Leave empty to skip."}
+      </>
+    ),
+    secret: true,
+    placeholder: (draft) =>
+      draft.niconicoSession
+        ? 'Enter to keep, "-" to remove'
+        : "Optional: user_session_...",
+    submit: (value, draft, handlers) => {
+      const trimmed = value.trim();
+      const nextSession =
+        trimmed === "-" ? "" : trimmed || draft.niconicoSession;
 
-          handlers.commitDraft({
-            ...draft,
-            token: nextToken,
-          });
-          handlers.goToStage("prefix");
-        }}
-      />
-    </FieldScreen>
-  );
-}
+      handlers.goToPostEditStage({
+        ...draft,
+        niconicoSession: nextSession,
+      });
+    },
+  },
+};
 
-function PrefixScreen({
+function SetupFieldScreen({
+  stage,
   headerProps,
   draft,
   validationIssues,
   handlers,
 }: InputScreenProps) {
+  const field = SETUP_FIELDS[stage];
+  const placeholder = field.placeholder(draft);
+  const onSubmit = (value: string) => {
+    field.submit(value, draft, handlers);
+  };
+
   return (
     <FieldScreen
       headerProps={headerProps}
-      title="Command prefix"
-      description="Examples: `!`, `?`, `!!`"
+      title={field.title}
+      description={field.describe(draft)}
       validationIssues={validationIssues}
     >
-      <TextInput
-        placeholder="!"
-        defaultValue={draft.prefix}
-        onSubmit={(value) => {
-          const nextPrefix = value.trim();
-
-          if (!nextPrefix) {
-            handlers.failValidation(["Command prefix is required."], "prefix");
-            return;
-          }
-
-          handlers.commitDraft({
-            ...draft,
-            prefix: nextPrefix,
-          });
-          handlers.goToStage("niconicoUser");
-        }}
-      />
-    </FieldScreen>
-  );
-}
-
-function NiconicoUserScreen({
-  headerProps,
-  draft,
-  validationIssues,
-  handlers,
-}: InputScreenProps) {
-  return (
-    <FieldScreen
-      headerProps={headerProps}
-      title="NicoNico username or email"
-      description="Leave empty to run without NicoNico account credentials."
-      validationIssues={validationIssues}
-    >
-      <TextInput
-        placeholder="Optional"
-        defaultValue={draft.niconicoUser}
-        onSubmit={(value) => {
-          const nextUser = value.trim();
-
-          if (!nextUser) {
-            handlers.commitDraft({
-              ...draft,
-              niconicoUser: "",
-              niconicoPassword: "",
-            });
-            handlers.goToStage("niconicoSession");
-            return;
-          }
-
-          handlers.commitDraft({
-            ...draft,
-            niconicoUser: nextUser,
-          });
-          handlers.goToStage("niconicoPassword");
-        }}
-      />
-    </FieldScreen>
-  );
-}
-
-function NiconicoPasswordScreen({
-  headerProps,
-  draft,
-  validationIssues,
-  handlers,
-}: InputScreenProps) {
-  return (
-    <FieldScreen
-      headerProps={headerProps}
-      title="NicoNico password"
-      description={
-        draft.niconicoPassword
-          ? "Press Enter to keep the current password."
-          : "Required only when using a NicoNico account."
-      }
-      validationIssues={validationIssues}
-    >
-      <PasswordInput
-        placeholder={
-          draft.niconicoPassword
-            ? "Press Enter to keep the current password"
-            : "Enter NicoNico password"
-        }
-        onSubmit={(value) => {
-          const nextPassword = value || draft.niconicoPassword;
-
-          if (!nextPassword.trim()) {
-            handlers.failValidation(
-              ["NicoNico password is required when a NicoNico user is set."],
-              "niconicoPassword",
-            );
-            return;
-          }
-
-          handlers.commitDraft({
-            ...draft,
-            niconicoPassword: nextPassword,
-          });
-          handlers.goToStage("niconicoSession");
-        }}
-      />
-    </FieldScreen>
-  );
-}
-
-function NiconicoSessionScreen({
-  headerProps,
-  draft,
-  validationIssues,
-  handlers,
-}: InputScreenProps) {
-  return (
-    <FieldScreen
-      headerProps={headerProps}
-      title="NicoNico session cookie"
-      description={
-        <>
-          Paste the `user_session` cookie value from a logged-in browser. This
-          is the most reliable login (it survives 2FA) and helps avoid
-          mid-playback stops on restricted videos.
-          {draft.niconicoSession
-            ? ' Press Enter to keep it, or type "-" to remove it.'
-            : " Leave empty to skip."}
-        </>
-      }
-      validationIssues={validationIssues}
-    >
-      <PasswordInput
-        placeholder={
-          draft.niconicoSession
-            ? 'Enter to keep, "-" to remove'
-            : "Optional: user_session_..."
-        }
-        onSubmit={(value) => {
-          const trimmed = value.trim();
-          // "-" explicitly clears a saved cookie (e.g. to switch back to
-          // username/password); empty input keeps the existing value so the
-          // edit flow does not silently wipe it.
-          const nextSession =
-            trimmed === "-" ? "" : trimmed || draft.niconicoSession;
-
-          handlers.goToPostEditStage({
-            ...draft,
-            niconicoSession: nextSession,
-          });
-        }}
-      />
+      {field.secret ? (
+        <PasswordInput placeholder={placeholder} onSubmit={onSubmit} />
+      ) : (
+        <TextInput
+          placeholder={placeholder}
+          defaultValue={field.defaultValue(draft)}
+          onSubmit={onSubmit}
+        />
+      )}
     </FieldScreen>
   );
 }

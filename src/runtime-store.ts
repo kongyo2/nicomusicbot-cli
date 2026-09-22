@@ -39,36 +39,19 @@ export class RuntimeStore {
   }
 
   setStatus(status: RuntimeStatus, error?: string): void {
-    this.state = {
-      ...this.state,
-      status,
-      error,
-    };
-    this.emit();
+    this.patch({ status, error });
   }
 
   setProgress(progress?: ProgressState): void {
-    this.state = {
-      ...this.state,
-      progress,
-    };
-    this.emit();
+    this.patch({ progress });
   }
 
   setDependencies(dependencies: DependencyCheck[]): void {
-    this.state = {
-      ...this.state,
-      dependencies,
-    };
-    this.emit();
+    this.patch({ dependencies });
   }
 
   setConnectedUser(connectedUser?: string): void {
-    this.state = {
-      ...this.state,
-      connectedUser,
-    };
-    this.emit();
+    this.patch({ connectedUser });
   }
 
   upsertGuild(snapshot: GuildSnapshot): void {
@@ -85,27 +68,17 @@ export class RuntimeStore {
 
     guilds.sort((a, b) => a.guildName.localeCompare(b.guildName));
 
-    this.state = {
-      ...this.state,
-      guilds,
-    };
-    this.emit();
+    this.patch({ guilds });
   }
 
   removeGuild(guildId: string): void {
-    this.state = {
-      ...this.state,
+    this.patch({
       guilds: this.state.guilds.filter((guild) => guild.guildId !== guildId),
-    };
-    this.emit();
+    });
   }
 
   clearGuilds(): void {
-    this.state = {
-      ...this.state,
-      guilds: [],
-    };
-    this.emit();
+    this.patch({ guilds: [] });
   }
 
   addLog(level: LogLevel, message: string): void {
@@ -118,14 +91,15 @@ export class RuntimeStore {
       message,
     };
 
-    this.state = {
-      ...this.state,
-      logs: [...this.state.logs.slice(-199), entry],
-    };
-    this.emit();
+    this.patch({ logs: [...this.state.logs.slice(-199), entry] });
   }
 
-  private emit(): void {
+  private patch(changes: Partial<DashboardState>): void {
+    this.state = {
+      ...this.state,
+      ...changes,
+    };
+
     for (const listener of this.listeners) {
       listener();
     }

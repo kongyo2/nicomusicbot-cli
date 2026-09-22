@@ -4,14 +4,11 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { z } from "zod";
 import { normalizeErrorMessage } from "./errors.js";
-import type { BotConfig, ConfigDraft } from "./types.js";
+import type { BotConfig, ConfigDraft, NiconicoCredentials } from "./types.js";
 
-type PersistedConfig = {
+type PersistedConfig = NiconicoCredentials & {
   token?: string;
   prefix?: string;
-  niconicoUser?: string;
-  niconicoPassword?: string;
-  niconicoSession?: string;
 };
 
 export type CliOptions = {
@@ -56,8 +53,6 @@ const botConfigSchema = z
     configPath: z.string().min(1),
   })
   .superRefine((value, ctx) => {
-    // A session cookie is the preferred auth and takes precedence at runtime,
-    // so a stale/partial username/password pair should not block startup.
     if (value.niconicoSession) {
       return;
     }
