@@ -266,8 +266,6 @@ describe("niconico helpers", () => {
     ]);
   });
 
-  // Regression: the API rejects sortKey=hot with an explicit sort direction,
-  // which used to make every /search/ link fall back to yt-dlp.
   it("asks for relevance-sorted search results without a sort direction", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       Response.json({
@@ -295,8 +293,6 @@ describe("niconico helpers", () => {
     expect(requested.searchParams.get("sortOrder")).toBe("none");
   });
 
-  // Regression: NicoNico addresses genres by opaque key, so the readable "all"
-  // slug in a pasted ranking URL used to 302 and fall back to yt-dlp.
   describe("ranking genre keys", () => {
     const rankingResponse = (featuredKey: string, label: string) =>
       Response.json({
@@ -339,7 +335,6 @@ describe("niconico helpers", () => {
     });
 
     it("passes a real opaque key straight through", async () => {
-      // A fresh Response per call: a body can only be consumed once.
       const fetchMock = vi
         .fn<typeof fetch>()
         .mockImplementation(async () => rankingResponse("wq76qdin", "音楽"));
@@ -351,14 +346,11 @@ describe("niconico helpers", () => {
         {},
       );
 
-      // First request looks the genre list up, second fetches that ranking.
       expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain(
         "/genre/wq76qdin",
       );
     });
 
-    // nicovideo.jp itself 302s a legacy slug URL to the overall ranking, so
-    // translating the slug recovers the genre the link actually asked for.
     it("translates a legacy readable slug to its current genre key", async () => {
       const fetchMock = vi
         .fn<typeof fetch>()
@@ -414,8 +406,6 @@ describe("niconico helpers", () => {
     });
   });
 
-  // Regression: the series path used to fetch a single page and slice it, so
-  // a series longer than one page silently lost its tail.
   it("pages through a series longer than one request", async () => {
     const seriesPage = (page: number, totalCount: number) =>
       Response.json({
@@ -513,19 +503,15 @@ describe("niconico helpers", () => {
       title: "陰陽師",
       durationSeconds: 320,
       contentUrl: "https://delivery.example.test/audio.m3u8",
-      // The highest-quality available rendition wins.
       audioStreamId: "audio-aac-128kbps",
       audioBitRate: 128000,
     });
-    // The Domand cookie is the load-bearing header: the CDN rejects the
-    // playlist request without it.
     expect(stream.headers).toMatchObject({
       Origin: "https://www.nicovideo.jp",
       Referer: "https://www.nicovideo.jp/",
       Cookie: "domand_bid=bid-value",
     });
 
-    // Crucially: no videoStreamId in the outputs, so the CDN serves audio only.
     const accessRightsInit = fetchMock.mock.calls[1][1];
     expect(JSON.parse(String(accessRightsInit?.body))).toEqual({
       outputs: [["audio-aac-128kbps"]],
@@ -553,8 +539,6 @@ describe("niconico helpers", () => {
     );
   });
 
-  // Regression: when both paths fail the user used to see only the yt-dlp
-  // error, losing the NicoNico reason that actually explains the failure.
   it("reports both failures when the yt-dlp fallback also fails", async () => {
     vi.stubGlobal(
       "fetch",
@@ -563,7 +547,6 @@ describe("niconico helpers", () => {
         .mockResolvedValue(new Response("nope", { status: 404 })),
     );
 
-    // yt-dlp is not on PATH under this name, so the fallback fails too.
     const error = await fetchEntries(
       "https://www.nicovideo.jp/mylist/1",
       {},

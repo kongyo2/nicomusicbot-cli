@@ -31,6 +31,7 @@ import type { ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizeErrorMessage } from "./errors.js";
 import {
+  authArgs as buildAuthArgs,
   buildNiconicoCookieFile,
   fetchEntries,
   makeTrackUrl,
@@ -91,12 +92,6 @@ async function sendWithRetry(
   }
 }
 
-/**
- * Resolve once the child process is actually running, and reject when the
- * binary is missing. `spawn()` surfaces ENOENT asynchronously, so without this
- * a caller sees healthy stdio streams, announces the track, and then hits EOF
- * and skips it with nothing said in the channel.
- */
 export async function waitForSpawn(
   child: ChildProcess,
   command: string,
@@ -111,14 +106,8 @@ export async function waitForSpawn(
   }
 }
 
-/** Keep only the tail of a child's stderr; enough to explain an exit code. */
 const STDERR_TAIL_LIMIT = 2_000;
 
-/**
- * Consume a child's stderr and return a getter for its tail. Spawning with a
- * piped stderr that nothing reads risks filling the pipe buffer and blocking
- * the child, so this is about liveness as much as diagnostics.
- */
 export function drainStderr(child: ChildProcess): () => string {
   let buffered = "";
 
@@ -180,19 +169,43 @@ async function runSetupCommand(
   }
 }
 
+function describeSetupFailure(prefix: string, output: string): string {
+  return `${prefix}: ${output || "no output"}`;
+}
+
+function skippedSetup(...logs: string[]): DependencySetupResult {
+  return { attempted: false, changed: false, logs };
+}
+
+async function runSetupStep(
+  logs: string[],
+  step: { command: string; args: string[]; success: string; failure: string },
+): Promise<boolean> {
+  const result = await runSetupCommand(step.command, step.args);
+
+  logs.push(
+    result.ok
+      ? step.success
+      : describeSetupFailure(step.failure, result.output),
+  );
+
+  return result.ok;
+}
+
+const WINGET_PACKAGE_IDS: ReadonlyArray<{ command: string; id: string }> = [
+  { command: "ffmpeg", id: "Gyan.FFmpeg" },
+  { command: "yt-dlp", id: "yt-dlp.yt-dlp" },
+];
+
 async function setupLinuxDependencies(
   missingCommands: Set<string>,
 ): Promise<DependencySetupResult> {
-  const logs: string[] = [];
-  let changed = false;
-
-  const hasApt = await commandExists("apt-get");
-
-  if (!hasApt) {
-    logs.push("apt-get was not found. Skipped Linux auto-setup.");
-    return { attempted: false, changed: false, logs };
+  if (!(await commandExists("apt-get"))) {
+    return skippedSetup("apt-get was not found. Skipped Linux auto-setup.");
   }
 
+  const logs: string[] = [];
+  let changed = false;
   const installTargets: string[] = [];
 
   if (missingCommands.has("ffmpeg")) {
@@ -207,148 +220,130 @@ async function setupLinuxDependencies(
     const update = await runSetupCommand("apt-get", ["update"]);
 
     if (!update.ok) {
-      logs.push(`apt-get update failed: ${update.output || "no output"}`);
+      logs.push(describeSetupFailure("apt-get update failed", update.output));
     } else {
-      const install = await runSetupCommand("apt-get", [
-        "install",
-        "-y",
-        ...Array.from(new Set(installTargets)),
-      ]);
+      const installed = await runSetupStep(logs, {
+        command: "apt-get",
+        args: ["install", "-y", ...Array.from(new Set(installTargets))],
+        success: "Installed packages through apt-get.",
+        failure: "apt-get install failed",
+      });
 
-      logs.push(
-        install.ok
-          ? "Installed packages through apt-get."
-          : `apt-get install failed: ${install.output || "no output"}`,
-      );
-      changed = changed || install.ok;
+      changed = changed || installed;
     }
   }
 
   if (missingCommands.has("yt-dlp")) {
-    const pipInstall = await runSetupCommand("python3", [
-      "-m",
-      "pip",
-      "install",
-      "-U",
-      "yt-dlp",
-      "--break-system-packages",
-    ]);
+    const updated = await runSetupStep(logs, {
+      command: "python3",
+      args: ["-m", "pip", "install", "-U", "yt-dlp", "--break-system-packages"],
+      success: "Updated yt-dlp through python3 -m pip.",
+      failure: "pip yt-dlp install failed",
+    });
 
-    logs.push(
-      pipInstall.ok
-        ? "Updated yt-dlp through python3 -m pip."
-        : `pip yt-dlp install failed: ${pipInstall.output || "no output"}`,
-    );
-    changed = changed || pipInstall.ok;
+    changed = changed || updated;
   }
 
   return { attempted: true, changed, logs };
+}
+
+async function setupMacosDependencies(
+  missingCommands: Set<string>,
+): Promise<DependencySetupResult> {
+  if (!(await commandExists("brew"))) {
+    return skippedSetup("Homebrew was not found. Skipped macOS auto-setup.");
+  }
+
+  const targets = Array.from(missingCommands);
+  const logs: string[] = [];
+  const changed = await runSetupStep(logs, {
+    command: "brew",
+    args: ["install", ...targets],
+    success: `Installed dependencies with Homebrew: ${targets.join(", ")}`,
+    failure: "brew install failed",
+  });
+
+  return { attempted: true, changed, logs };
+}
+
+async function setupWindowsDependencies(
+  missingCommands: Set<string>,
+): Promise<DependencySetupResult> {
+  if (!(await commandExists("winget"))) {
+    return skippedSetup("winget was not found. Skipped Windows auto-setup.");
+  }
+
+  const logs: string[] = [];
+  let changed = false;
+
+  for (const target of WINGET_PACKAGE_IDS) {
+    if (!missingCommands.has(target.command)) {
+      continue;
+    }
+
+    const installed = await runSetupStep(logs, {
+      command: "winget",
+      args: [
+        "install",
+        "-e",
+        "--id",
+        target.id,
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+      ],
+      success: `Installed ${target.command} via winget.`,
+      failure: `winget ${target.command} install failed`,
+    });
+
+    changed = changed || installed;
+  }
+
+  return { attempted: true, changed, logs };
+}
+
+export function findMissingInstallable(
+  checks: DependencyCheck[],
+): DependencyCheck[] {
+  return checks.filter((check) => !check.ok && check.autoInstall === true);
+}
+
+export function describeMissingDependencies(
+  checks: DependencyCheck[],
+): string | undefined {
+  const missing = checks.filter((check) => !check.ok && check.required);
+
+  if (missing.length === 0) {
+    return undefined;
+  }
+
+  return `Missing dependencies: ${missing
+    .map((check) => check.command)
+    .join(", ")}`;
 }
 
 export async function autoSetupPrerequisites(
   checks: DependencyCheck[],
 ): Promise<DependencySetupResult> {
   const missingCommands = new Set(
-    checks
-      .filter((check) => !check.ok && check.autoInstall === true)
-      .map((check) => check.command),
+    findMissingInstallable(checks).map((check) => check.command),
   );
 
   if (missingCommands.size === 0) {
-    return { attempted: false, changed: false, logs: [] };
+    return skippedSetup();
   }
 
-  if (process.platform === "linux") {
-    return setupLinuxDependencies(missingCommands);
-  }
-
-  if (process.platform === "darwin") {
-    const hasBrew = await commandExists("brew");
-
-    if (!hasBrew) {
-      return {
-        attempted: false,
-        changed: false,
-        logs: ["Homebrew was not found. Skipped macOS auto-setup."],
-      };
-    }
-
-    const targets = Array.from(missingCommands);
-    const install = await runSetupCommand("brew", ["install", ...targets]);
-
-    return {
-      attempted: true,
-      changed: install.ok,
-      logs: [
-        install.ok
-          ? `Installed dependencies with Homebrew: ${targets.join(", ")}`
-          : `brew install failed: ${install.output || "no output"}`,
-      ],
-    };
-  }
-
-  if (process.platform === "win32") {
-    const hasWinget = await commandExists("winget");
-
-    if (!hasWinget) {
-      return {
-        attempted: false,
-        changed: false,
-        logs: ["winget was not found. Skipped Windows auto-setup."],
-      };
-    }
-
-    const logs: string[] = [];
-    let changed = false;
-
-    if (missingCommands.has("ffmpeg")) {
-      const ffmpeg = await runSetupCommand("winget", [
-        "install",
-        "-e",
-        "--id",
-        "Gyan.FFmpeg",
-        "--accept-package-agreements",
-        "--accept-source-agreements",
-      ]);
-
-      logs.push(
-        ffmpeg.ok
-          ? "Installed ffmpeg via winget."
-          : `winget ffmpeg install failed: ${ffmpeg.output || "no output"}`,
+  switch (process.platform) {
+    case "linux":
+      return setupLinuxDependencies(missingCommands);
+    case "darwin":
+      return setupMacosDependencies(missingCommands);
+    case "win32":
+      return setupWindowsDependencies(missingCommands);
+    default:
+      return skippedSetup(
+        "Auto-setup is not implemented for this operating system.",
       );
-      changed = changed || ffmpeg.ok;
-    }
-
-    if (missingCommands.has("yt-dlp")) {
-      const ytdlp = await runSetupCommand("winget", [
-        "install",
-        "-e",
-        "--id",
-        "yt-dlp.yt-dlp",
-        "--accept-package-agreements",
-        "--accept-source-agreements",
-      ]);
-
-      logs.push(
-        ytdlp.ok
-          ? "Installed yt-dlp via winget."
-          : `winget yt-dlp install failed: ${ytdlp.output || "no output"}`,
-      );
-      changed = changed || ytdlp.ok;
-    }
-
-    return {
-      attempted: true,
-      changed,
-      logs,
-    };
   }
-
-  return {
-    attempted: false,
-    changed: false,
-    logs: ["Auto-setup is not implemented for this operating system."],
-  };
 }
 
 export async function checkPrerequisites(): Promise<DependencyCheck[]> {
@@ -370,8 +365,6 @@ export async function checkPrerequisites(): Promise<DependencyCheck[]> {
       details: checks[0]
         ? "Found in PATH."
         : "Not found in PATH. Only needed as a fallback; NicoNico playback uses the built-in client.",
-      // No longer required: @kongyo2/niconicojs resolves streams natively and
-      // yt-dlp is consulted only when that fails.
       required: false,
       autoInstall: true,
     },
@@ -398,10 +391,6 @@ export async function checkPrerequisites(): Promise<DependencyCheck[]> {
 class GuildController {
   private readonly player = createAudioPlayer({
     behaviors: {
-      // Keep decoding through brief subscriber gaps (e.g. a voice server
-      // migration) instead of pausing, which previously stalled playback
-      // mid-track. An empty channel is handled separately by destroying the
-      // connection, so this never plays into the void for long.
       noSubscriber: NoSubscriberBehavior.Play,
       maxMissedFrames: 250,
     },
@@ -529,9 +518,6 @@ class GuildController {
   private attachConnectionRecovery(
     connection: ReturnType<typeof joinVoiceChannel>,
   ): void {
-    // joinVoiceChannel can reuse the per-guild connection, so clear any handler
-    // we previously attached before adding a fresh one to avoid stacking
-    // listeners across reconnects.
     connection.removeAllListeners(VoiceConnectionStatus.Disconnected);
     connection.on(VoiceConnectionStatus.Disconnected, () => {
       void this.handleDisconnected(connection);
@@ -541,8 +527,6 @@ class GuildController {
   private async handleDisconnected(
     connection: ReturnType<typeof joinVoiceChannel>,
   ): Promise<void> {
-    // Ignore disconnects from a connection we already replaced, or once the
-    // controller has been stopped/torn down.
     if (this.connection !== connection || this.recovering || this.defunct) {
       return;
     }
@@ -550,25 +534,16 @@ class GuildController {
     this.recovering = true;
 
     try {
-      // Discord routinely migrates the voice server, which surfaces as a brief
-      // disconnect followed by an automatic re-handshake (Signalling/Connecting).
-      // Give the connection a chance to resume on its own; the player stays
-      // subscribed so audio continues once it returns to Ready.
       await Promise.race([
         entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
       return;
     } catch {
-      // The connection did not re-handshake, so this is an intentional or
-      // unrecoverable disconnect (e.g. a moderator removed the bot). Do NOT
-      // fight it with a rejoin loop — tear down cleanly instead.
     } finally {
       this.recovering = false;
     }
 
-    // A stop()/destroy() (or a replacement connection) may have run while we
-    // were waiting; only tear down if this is still the active connection.
     if (this.connection !== connection || this.defunct) {
       return;
     }
@@ -633,8 +608,6 @@ class GuildController {
   }
 
   async destroy(): Promise<void> {
-    // Mark defunct synchronously so an in-flight disconnect handler cancels its
-    // pending recovery instead of rejoining after an explicit stop.
     this.defunct = true;
 
     await this.serialize(async () => {
@@ -857,11 +830,6 @@ class GuildController {
           ? this.spawnFfmpegFromUrl(native)
           : this.spawnFfmpegFromPipe();
 
-        // Track it before anything below can throw. Everything after this
-        // point — the stdout check, the spawn wait, the whole yt-dlp branch —
-        // can fail, and cleanupProcesses() can only kill what it can see.
-        // An ffmpeg reading pipe:0 that nobody writes to never exits on its
-        // own, so an untracked one would hang around per failed track.
         this.ffmpegProcess = ffmpeg;
 
         if (!ffmpeg.stdout) {
@@ -875,20 +843,9 @@ class GuildController {
           );
         });
 
-        // stderr is a pipe nobody reads otherwise: drain it so a chatty
-        // failure cannot fill the buffer and wedge ffmpeg, and keep the tail
-        // to explain a nonzero exit.
         const ffmpegStderr = drainStderr(ffmpeg);
 
-        // A failure after a clean start (an expired playlist, an HTTP error
-        // from the CDN) arrives as "close", not "error". Its stdout just hits
-        // EOF, which the player reads as a finished track, so without this the
-        // channel sees "Now playing" and then silence.
         ffmpeg.on("close", (code) => {
-          // Skip and stop kill the process, and ffmpeg handles SIGTERM itself
-          // rather than dying from it — measured, that surfaces as 255, or 0,
-          // or null with a signal depending on how far it had got. Only
-          // `killed` reliably separates that from a genuine failure.
           if (code === 0 || ffmpeg.killed || this.current?.id !== next.id) {
             return;
           }
@@ -903,15 +860,11 @@ class GuildController {
           );
         });
 
-        // spawn() reports a missing binary asynchronously via an "error"
-        // event, long after the stdio streams look healthy. Without this the
-        // track would be announced as playing and then silently skipped.
         await waitForSpawn(ffmpeg, "ffmpeg");
 
         if (!native) {
           const ytDlp = this.spawnYtDlp(url);
 
-          // Same reasoning as ffmpeg above: track first, then validate.
           this.ytDlpProcess = ytDlp;
 
           if (!ytDlp.stdout || !ffmpeg.stdin) {
@@ -925,19 +878,14 @@ class GuildController {
             );
           });
 
-          // Same unread pipe as ffmpeg's, and yt-dlp is the noisier of the two.
           ytDlpStderr = drainStderr(ytDlp);
 
-          // yt-dlp is optional now, so a machine without it reaches here.
           await waitForSpawn(ytDlp, "yt-dlp");
 
           ytDlp.stdout.pipe(ffmpeg.stdin);
           ytDlp.on("close", (code) => {
             ffmpeg.stdin?.end();
 
-            // A non-zero exit while this track is still current means the
-            // stream ended early. Surface it so the truncation is diagnosable
-            // instead of silently looking like a normal end-of-track.
             if (code && code !== 0 && this.current?.id === next.id) {
               const details = ytDlpStderr?.().trim() || "no stderr output";
               this.service.log(
@@ -981,8 +929,6 @@ class GuildController {
         await this.notify(`Now playing: ${title}\n${url}`);
         return;
       } catch (error) {
-        // The native failure is the actionable half when the fallback dies
-        // too, and it would otherwise only ever reach the dashboard log.
         this.lastError =
           nativeError === undefined
             ? normalizeErrorMessage(error)
@@ -1013,11 +959,6 @@ class GuildController {
         "-f",
         "bestaudio[abr<=128]/bestaudio",
         "--no-playlist",
-        // NicoNico delivers audio as AES-128 encrypted HLS. A single failed or
-        // timed-out fragment used to abort the whole download, which the bot
-        // observed as playback stopping mid-track. Retry transient failures and
-        // skip (rather than abort on) a fragment that is permanently gone so a
-        // glitch costs at most a few seconds instead of the rest of the song.
         "--no-abort-on-unavailable-fragments",
         "--retries",
         "10",
@@ -1027,12 +968,6 @@ class GuildController {
         "5",
         "--retry-sleep",
         "2",
-        // Without pycryptodomex, yt-dlp delegates the encrypted HLS download to
-        // ffmpeg, whose default has no reconnection. Pass input-side reconnect
-        // flags (the `ffmpeg_i:` prefix places them before `-i`, where they take
-        // effect) so the delegated download reconnects on network errors. These
-        // are ignored when the native downloader is used, so it is safe in both
-        // modes.
         "--downloader-args",
         "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx -reconnect_delay_max 30 -rw_timeout 30000000",
         "-o",
@@ -1047,11 +982,6 @@ class GuildController {
     );
   }
 
-  /**
-   * Ask NicoNico's DMS API for an audio-only HLS playlist. Returns undefined
-   * when the native path cannot serve the track, which sends the caller down
-   * the yt-dlp fallback.
-   */
   private async resolveNativeStream(
     entry: TrackEntry,
   ): Promise<{ stream?: NativeAudioStream; error?: unknown }> {
@@ -1073,17 +1003,10 @@ class GuildController {
         `[${this.guild.name}] Native stream resolution failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
       );
 
-      // Hand the error back rather than swallowing it: only the dashboard
-      // sees the warning above, and if the fallback fails too this is the
-      // half that explains why (membership required, deleted, and so on).
       return { error };
     }
   }
 
-  /**
-   * Decode a signed HLS playlist straight to PCM. ffmpeg fetches the segments
-   * itself, so there is no second process in the pipeline at all.
-   */
   private spawnFfmpegFromUrl(stream: NativeAudioStream): ChildProcess {
     const headerLines = Object.entries(stream.headers)
       .map(([name, value]) => `${name}: ${value}\r\n`)
@@ -1095,11 +1018,8 @@ class GuildController {
         "-hide_banner",
         "-loglevel",
         "error",
-        // The CDN rejects requests without the Domand cookie and origin.
         "-headers",
         headerLines,
-        // A dropped segment fetch used to end the track early; reconnect
-        // instead so a network glitch costs seconds, not the rest of the song.
         "-reconnect",
         "1",
         "-reconnect_streamed",
@@ -1181,12 +1101,6 @@ export class NicomusicBotService {
     this.store.addLog(level, message);
   }
 
-  /**
-   * Auth object passed to the helpers in niconico.ts. The raw `user_session`
-   * drives the native client; the cookies.txt path and username/password only
-   * matter to the yt-dlp fallback, where password login is unreliable anyway
-   * (2FA and the broken yt-dlp login flow).
-   */
   niconicoAuth(): NicoAuth {
     return {
       niconicoUser: this.config.niconicoUser,
@@ -1197,20 +1111,7 @@ export class NicomusicBotService {
   }
 
   authArgs(): string[] {
-    if (this.cookiesPath) {
-      return ["--cookies", this.cookiesPath];
-    }
-
-    if (this.config.niconicoUser && this.config.niconicoPassword) {
-      return [
-        "--username",
-        this.config.niconicoUser,
-        "--password",
-        this.config.niconicoPassword,
-      ];
-    }
-
-    return [];
+    return buildAuthArgs(this.niconicoAuth());
   }
 
   private async ensureCookieFile(): Promise<void> {
@@ -1239,10 +1140,6 @@ export class NicomusicBotService {
     }
   }
 
-  /**
-   * Confirm the NicoNico session before Discord login so an expired cookie
-   * shows up as one clear startup warning instead of a failure on every track.
-   */
   private async verifySession(): Promise<void> {
     if (!this.config.niconicoSession) {
       this.log(
@@ -1261,9 +1158,6 @@ export class NicomusicBotService {
           `NicoNico session verified as ${user.nickname}${user.isPremium ? " (premium)" : ""}.`,
         );
       } else {
-        // A session was configured but did not parse into a usable cookie
-        // value, so the client never logged in. Say so rather than starting
-        // up silently as a guest.
         this.log(
           "warn",
           "The configured NicoNico session could not be used; playback runs as a guest.",
@@ -1393,10 +1287,6 @@ export class NicomusicBotService {
     return controller;
   }
 
-  /**
-   * Drop a controller that tore itself down (e.g. after the bot was removed
-   * from the voice channel) so a later command rebuilds a fresh one.
-   */
   removeGuildController(guildId: string): void {
     this.guildControllers.delete(guildId);
     this.store.removeGuild(guildId);
@@ -1457,23 +1347,58 @@ export class NicomusicBotService {
     }
   }
 
+  private async requireVoiceMember(
+    message: Message,
+    channel: GuildTextBasedChannel,
+    rest: string,
+    usage: string,
+  ): Promise<GuildMember | undefined> {
+    if (!rest) {
+      await sendWithRetry(channel, usage);
+      return undefined;
+    }
+
+    if (!message.member?.voice.channel) {
+      await sendWithRetry(channel, "Join a voice channel first.");
+      return undefined;
+    }
+
+    return message.member;
+  }
+
+  private async requireController(
+    message: Message,
+    channel: GuildTextBasedChannel,
+    missingNotice: string,
+  ): Promise<GuildController | undefined> {
+    const controller = this.guildControllers.get(message.guild!.id);
+
+    if (!controller) {
+      await sendWithRetry(channel, missingNotice);
+      return undefined;
+    }
+
+    return controller;
+  }
+
   private async handlePlayCommand(
     message: Message,
     channel: GuildTextBasedChannel,
     rest: string,
   ): Promise<void> {
-    if (!rest) {
-      await sendWithRetry(channel, `Usage: ${this.config.prefix}play <url>`);
-      return;
-    }
+    const member = await this.requireVoiceMember(
+      message,
+      channel,
+      rest,
+      `Usage: ${this.config.prefix}play <url>`,
+    );
 
-    if (!message.member?.voice.channel) {
-      await sendWithRetry(channel, "Join a voice channel first.");
+    if (!member) {
       return;
     }
 
     const controller = this.getOrCreateGuildController(message.guild!);
-    await controller.connect(message.member, channel);
+    await controller.connect(member, channel);
     const entries = await fetchEntries(
       normalizeNiconicoUrl(rest),
       this.niconicoAuth(),
@@ -1485,7 +1410,7 @@ export class NicomusicBotService {
       return;
     }
 
-    controller.enqueueEntries(entries, message.member.displayName);
+    controller.enqueueEntries(entries, member.displayName);
 
     if (entries.length > 1) {
       await sendWithRetry(
@@ -1502,16 +1427,14 @@ export class NicomusicBotService {
     channel: GuildTextBasedChannel,
     rest: string,
   ): Promise<void> {
-    if (!rest) {
-      await sendWithRetry(
-        channel,
-        `Usage: ${this.config.prefix}tag <tag|url> [limit]`,
-      );
-      return;
-    }
+    const member = await this.requireVoiceMember(
+      message,
+      channel,
+      rest,
+      `Usage: ${this.config.prefix}tag <tag|url> [limit]`,
+    );
 
-    if (!message.member?.voice.channel) {
-      await sendWithRetry(channel, "Join a voice channel first.");
+    if (!member) {
       return;
     }
 
@@ -1523,7 +1446,7 @@ export class NicomusicBotService {
     }
 
     const controller = this.getOrCreateGuildController(message.guild!);
-    await controller.connect(message.member, channel);
+    await controller.connect(member, channel);
     await sendWithRetry(
       channel,
       `Searching NicoNico tag "${tag}" (limit ${limit})...`,
@@ -1535,7 +1458,7 @@ export class NicomusicBotService {
       return;
     }
 
-    controller.enqueueEntries(entries, message.member.displayName);
+    controller.enqueueEntries(entries, member.displayName);
     await sendWithRetry(
       channel,
       `Added ${entries.length} tracks from tag "${tag}".`,
@@ -1547,10 +1470,13 @@ export class NicomusicBotService {
     message: Message,
     channel: GuildTextBasedChannel,
   ): Promise<void> {
-    const controller = this.guildControllers.get(message.guild!.id);
+    const controller = await this.requireController(
+      message,
+      channel,
+      "Nothing is playing.",
+    );
 
     if (!controller) {
-      await sendWithRetry(channel, "Nothing is playing.");
       return;
     }
 
@@ -1568,10 +1494,13 @@ export class NicomusicBotService {
     message: Message,
     channel: GuildTextBasedChannel,
   ): Promise<void> {
-    const controller = this.guildControllers.get(message.guild!.id);
+    const controller = await this.requireController(
+      message,
+      channel,
+      "Queue is empty.",
+    );
 
     if (!controller) {
-      await sendWithRetry(channel, "Queue is empty.");
       return;
     }
 
@@ -1582,10 +1511,13 @@ export class NicomusicBotService {
     message: Message,
     channel: GuildTextBasedChannel,
   ): Promise<void> {
-    const controller = this.guildControllers.get(message.guild!.id);
+    const controller = await this.requireController(
+      message,
+      channel,
+      "Nothing is active in this guild.",
+    );
 
     if (!controller) {
-      await sendWithRetry(channel, "Nothing is active in this guild.");
       return;
     }
 
@@ -1602,10 +1534,9 @@ export class NicomusicBotService {
     channel: GuildTextBasedChannel,
     rest: string,
   ): Promise<void> {
-    const controller = this.guildControllers.get(message.guild!.id);
-
     if (!rest) {
-      const currentVolume = controller?.getVolumePercent() ?? 100;
+      const currentVolume =
+        this.guildControllers.get(message.guild!.id)?.getVolumePercent() ?? 100;
       await sendWithRetry(channel, `Current volume: ${currentVolume}%`);
       return;
     }
@@ -1620,9 +1551,9 @@ export class NicomusicBotService {
       return;
     }
 
-    const activeController =
-      controller ?? this.getOrCreateGuildController(message.guild!);
-    const applied = await activeController.setVolume(parsed);
+    const applied = await this.getOrCreateGuildController(
+      message.guild!,
+    ).setVolume(parsed);
     await sendWithRetry(channel, `Volume set to ${applied}%.`);
   }
 
@@ -1630,9 +1561,7 @@ export class NicomusicBotService {
     message: Message,
     channel: GuildTextBasedChannel,
   ): Promise<void> {
-    const controller =
-      this.guildControllers.get(message.guild!.id) ??
-      this.getOrCreateGuildController(message.guild!);
+    const controller = this.getOrCreateGuildController(message.guild!);
     const currentVolume = await controller.toggleMute();
 
     if (currentVolume === 0) {

@@ -8,26 +8,15 @@ import {
   pickBestAudio,
   type EssentialVideo,
   type RankingTerm,
+  type VideoSearchParams,
   type WatchResult,
 } from "@kongyo2/niconicojs";
 import { err, fromPromise, ok, type Result } from "neverthrow";
 import { normalizeError, normalizeErrorMessage } from "./errors.js";
 import { withRetry } from "./retry.js";
-import type { TrackEntry } from "./types.js";
+import type { NiconicoCredentials, TrackEntry } from "./types.js";
 
-export type NicoAuth = {
-  niconicoUser?: string;
-  niconicoPassword?: string;
-  /**
-   * Raw NicoNico `user_session` cookie. Consumed directly by
-   * @kongyo2/niconicojs, which is the primary resolution path.
-   */
-  niconicoSession?: string;
-  /**
-   * Path to a Netscape-format cookies.txt produced from the NicoNico
-   * `user_session` cookie. Only the yt-dlp fallback needs this; cookie auth
-   * survives 2FA and the broken yt-dlp password login flow.
-   */
+export type NicoAuth = NiconicoCredentials & {
   cookiesPath?: string;
 };
 
@@ -47,9 +36,7 @@ const VIDEO_ID_PREFIXES = [
   "z9",
 ] as const;
 
-/** Cap on how many videos a single collection (mylist/series/user) contributes. */
 const COLLECTION_LIMIT = 250;
-/** NicoNico's own page-size ceiling for the nvapi list endpoints. */
 const PAGE_SIZE = 100;
 
 class YtDlpCommandError extends Error {
@@ -63,11 +50,6 @@ class YtDlpCommandError extends Error {
   }
 }
 
-/**
- * Video is reachable but cannot be streamed by the native path (paid-only,
- * members-only, deleted, or region locked). Callers use this to decide whether
- * falling back to yt-dlp is worth attempting.
- */
 export class NiconicoUnplayableError extends Error {
   constructor(
     readonly videoId: string,
@@ -78,11 +60,6 @@ export class NiconicoUnplayableError extends Error {
   }
 }
 
-/**
- * Always dereference `globalThis.fetch` at call time rather than capturing it
- * when the client is built, so a stubbed fetch in tests is honoured no matter
- * when the cached client was created.
- */
 const lateBoundFetch = (input: string, init: RequestInit): Promise<Response> =>
   globalThis.fetch(input, init);
 
@@ -113,10 +90,6 @@ export function getNiconicoClient(auth: NicoAuth): NiconicoClient {
   return client;
 }
 
-/**
- * Reduce any of the shapes a user might paste — the bare value, a
- * `user_session=…` pair, or a full `Cookie:` header — to the raw cookie value.
- */
 export function normalizeSessionValue(
   session: string | undefined,
 ): string | undefined {
@@ -136,11 +109,6 @@ export function normalizeSessionValue(
   return value || undefined;
 }
 
-/**
- * Build a Netscape-format cookies.txt body from a NicoNico `user_session`
- * cookie value. Accepts either the raw value (`user_session_…`) or a
- * `name=value` pair pasted from devtools. Returns undefined when empty.
- */
 export function buildNiconicoCookieFile(session: string): string | undefined {
   const value = normalizeSessionValue(session);
 
@@ -148,7 +116,6 @@ export function buildNiconicoCookieFile(session: string): string | undefined {
     return undefined;
   }
 
-  // Far-future expiry so yt-dlp does not treat the cookie as a session cookie.
   const expiry = 2147483647;
 
   return [
@@ -310,11 +277,6 @@ function decodeSegment(value: string): string {
   }
 }
 
-/**
- * Work out which NicoNico API can serve a pasted link. Anything unrecognised
- * becomes `unknown` so the caller can hand it to the yt-dlp fallback rather
- * than guessing.
- */
 export function classifyNiconicoUrl(input: string): NiconicoResource {
   const normalized = normalizeNiconicoUrl(input);
   const bare = stripWrappingBrackets(input);
@@ -370,7 +332,6 @@ export function classifyNiconicoUrl(input: string): NiconicoResource {
   if (segments[0] === "ranking") {
     const term = url.searchParams.get("term") ?? undefined;
     const tag = url.searchParams.get("tag") ?? undefined;
-    // /ranking, /ranking/genre/<key>, /ranking/custom
     const featuredKey = segments[1] === "genre" ? segments[2] : undefined;
 
     return {
@@ -396,13 +357,6 @@ export function classifyNiconicoUrl(input: string): NiconicoResource {
   return { kind: "unknown" };
 }
 
-/**
- * Legacy readable genre slugs mapped to the genre labels NicoNico still
- * reports. Modern ranking URLs use opaque keys, and the site now 302s a slug
- * URL to the overall ranking, so translating them here recovers the genre an
- * older bookmark actually asked for. Going via the label rather than a
- * hardcoded key keeps this working if NicoNico rotates its keys.
- */
 const RANKING_GENRE_SLUG_LABELS: Record<string, string> = {
   all: "総合",
   game: "ゲーム",
@@ -430,12 +384,6 @@ const RANKING_GENRE_SLUG_LABELS: Record<string, string> = {
   other: "その他",
 };
 
-/**
- * Resolve whatever a ranking URL carried — an opaque key, a legacy slug, or a
- * genre label — into a key the API accepts. Falls back to the overall ranking
- * rather than failing the request, but says so instead of substituting it
- * silently.
- */
 async function resolveRankingGenreKey(
   client: NiconicoClient,
   featuredKey: string | undefined,
@@ -487,11 +435,24 @@ function entryFromEssentialVideo(video: EssentialVideo): TrackEntry {
   };
 }
 
-async function collectPaged<T>(
-  fetchPage: (page: number) => Promise<{ items: T[]; hasNext: boolean }>,
+function entriesFromVideos(
+  videos: readonly EssentialVideo[],
   limit: number,
-): Promise<T[]> {
-  const collected: T[] = [];
+): TrackEntry[] {
+  return videos.slice(0, limit).map(entryFromEssentialVideo);
+}
+
+function hasNextPage(page: number, totalCount: number): boolean {
+  return page * PAGE_SIZE < totalCount;
+}
+
+async function collectEntries(
+  limit: number,
+  fetchPage: (
+    page: number,
+  ) => Promise<{ items: readonly EssentialVideo[]; hasNext: boolean }>,
+): Promise<TrackEntry[]> {
+  const collected: EssentialVideo[] = [];
 
   for (let page = 1; collected.length < limit; page += 1) {
     const { items, hasNext } = await fetchPage(page);
@@ -503,7 +464,20 @@ async function collectPaged<T>(
     }
   }
 
-  return collected.slice(0, limit);
+  return entriesFromVideos(collected, limit);
+}
+
+async function searchEntries(
+  client: NiconicoClient,
+  limit: number,
+  params: VideoSearchParams,
+): Promise<TrackEntry[]> {
+  const result = await client.search.searchVideos({
+    ...params,
+    pageSize: Math.min(limit, PAGE_SIZE),
+  });
+
+  return entriesFromVideos(result.items, limit);
 }
 
 async function resolveResourceEntries(
@@ -525,37 +499,34 @@ async function resolveResourceEntries(
       ];
     }
 
-    case "mylist": {
-      const items = await collectPaged(async (page) => {
+    case "mylist":
+      return collectEntries(limit, async (page) => {
         const detail = await client.mylists.getMylist(resource.mylistId, {
           pageSize: PAGE_SIZE,
           page,
         });
 
-        return { items: detail.items, hasNext: detail.hasNext };
-      }, limit);
+        return {
+          items: detail.items.map((item) => item.video),
+          hasNext: detail.hasNext,
+        };
+      });
 
-      return items.map((item) => entryFromEssentialVideo(item.video));
-    }
-
-    case "series": {
-      const items = await collectPaged(async (page) => {
+    case "series":
+      return collectEntries(limit, async (page) => {
         const result = await client.series.getSeries(resource.seriesId, {
           pageSize: PAGE_SIZE,
           page,
         });
 
         return {
-          items: result.items,
-          hasNext: page * PAGE_SIZE < result.totalCount,
+          items: result.items.map((item) => item.video),
+          hasNext: hasNextPage(page, result.totalCount),
         };
-      }, limit);
+      });
 
-      return items.map((item) => entryFromEssentialVideo(item.video));
-    }
-
-    case "user": {
-      const items = await collectPaged(async (page) => {
+    case "user":
+      return collectEntries(limit, async (page) => {
         const result = await client.users.getUserVideos(
           Number(resource.userId),
           { pageSize: PAGE_SIZE, page },
@@ -563,12 +534,9 @@ async function resolveResourceEntries(
 
         return {
           items: result.items,
-          hasNext: page * PAGE_SIZE < result.totalCount,
+          hasNext: hasNextPage(page, result.totalCount),
         };
-      }, limit);
-
-      return items.map(entryFromEssentialVideo);
-    }
+      });
 
     case "ranking": {
       const featuredKey = await resolveRankingGenreKey(
@@ -582,32 +550,22 @@ async function resolveResourceEntries(
         ...(resource.tag ? { tag: resource.tag } : {}),
       });
 
-      return result.items.slice(0, limit).map(entryFromEssentialVideo);
+      return entriesFromVideos(result.items, limit);
     }
 
-    case "tag": {
-      const result = await client.search.searchVideos({
+    case "tag":
+      return searchEntries(client, limit, {
         tag: resource.tag,
-        pageSize: Math.min(limit, PAGE_SIZE),
         sortKey: "registeredAt",
         sortOrder: "desc",
       });
 
-      return result.items.slice(0, limit).map(entryFromEssentialVideo);
-    }
-
-    case "search": {
-      const result = await client.search.searchVideos({
+    case "search":
+      return searchEntries(client, limit, {
         keyword: resource.keyword,
-        pageSize: Math.min(limit, PAGE_SIZE),
-        // "hot" is a relevance ranking: the API rejects it with an explicit
-        // sort direction, so the order must be left unset.
         sortKey: "hot",
         sortOrder: "none",
       });
-
-      return result.items.slice(0, limit).map(entryFromEssentialVideo);
-    }
 
     default:
       return [];
@@ -715,11 +673,6 @@ async function runYtDlpJson(
   return ok(entries);
 }
 
-/**
- * yt-dlp fallback for anything the native client cannot resolve. Kept because
- * it still understands channel pages and other one-off URL shapes that the
- * public nvapi endpoints do not cover.
- */
 export async function fetchEntriesWithYtDlp(
   url: string,
   auth: NicoAuth,
@@ -745,11 +698,6 @@ export async function fetchEntriesWithYtDlp(
   return entriesResult.value;
 }
 
-/**
- * Resolve a pasted link into a playable queue. Tries the native nvapi client
- * first and only shells out to yt-dlp when that cannot answer, so the common
- * path needs no external binary at all.
- */
 export async function fetchEntries(
   url: string,
   auth: NicoAuth,
@@ -792,9 +740,6 @@ export async function fetchEntries(
       throw fallbackError;
     }
 
-    // Report both halves: only the dashboard sees the warning above, so
-    // without this the user is told yt-dlp failed and never learns why
-    // NicoNico did — which is usually the actionable half.
     throw new Error(
       `NicoNico ${resource.kind} lookup failed (${normalizeErrorMessage(nativeError)}) and the yt-dlp fallback failed (${normalizeErrorMessage(fallbackError)}).`,
       { cause: fallbackError },
@@ -806,9 +751,7 @@ export type NativeAudioStream = {
   videoId: string;
   title: string;
   durationSeconds: number;
-  /** Signed, audio-only HLS playlist URL. */
   contentUrl: string;
-  /** Origin/Referer/Cookie headers the CDN requires. */
   headers: Record<string, string>;
   audioStreamId: string;
   audioBitRate: number;
@@ -826,8 +769,6 @@ async function fetchWatchData(
   try {
     return await client.watch.getWatchData(videoId);
   } catch (error) {
-    // An expired or rejected session should degrade to guest access rather
-    // than failing the track outright; guest still plays most public videos.
     if (
       isNiconicoApiError(error) &&
       (error.isUnauthorized() || error.status === 403)
@@ -839,12 +780,6 @@ async function fetchWatchData(
   }
 }
 
-/**
- * Resolve a track straight to an audio-only HLS playlist through the DMS
- * (Domand) API. Requesting no video stream means the CDN serves a playlist
- * carrying only the AAC rendition, so playback pulls a fraction of the bytes a
- * full A/V download would.
- */
 export async function resolveNativeAudioStream(
   entry: TrackEntry,
   auth: NicoAuth,
@@ -889,8 +824,6 @@ export async function resolveNativeAudioStream(
   }
 
   try {
-    // Deliberately omit videoStreamId: that makes the access-rights request
-    // ask for `outputs: [[audio]]`, i.e. an audio-only playlist.
     const hls = await client.streaming.createHlsAccessRights({
       videoId: watch.data.video.id,
       accessRightKey: domand.accessRightKey,
@@ -942,9 +875,7 @@ export async function resolveTrackTitle(
       if (video?.title) {
         return video.title;
       }
-    } catch {
-      // Fall through to yt-dlp below.
-    }
+    } catch {}
   }
 
   const metadataResult = await runYtDlpJson([
@@ -993,11 +924,6 @@ export function parseTagRequest(raw: string): { tag: string; limit: number } {
   };
 }
 
-/**
- * Tag search through the snapshot API. The client retries transient failures
- * itself with jittered backoff and honours `Retry-After`, so there is no
- * second retry layer here.
- */
 export async function searchByTag(
   tagInput: string,
   limit: number,
@@ -1042,10 +968,6 @@ export async function searchByTag(
   });
 }
 
-/**
- * Confirm the configured session is live. Returns the account nickname so the
- * dashboard can show which NicoNico user the bot is acting as.
- */
 export async function verifyNiconicoSession(
   auth: NicoAuth,
 ): Promise<{ nickname: string; isPremium: boolean } | undefined> {

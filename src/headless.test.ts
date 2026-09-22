@@ -15,8 +15,6 @@ const okChecks: DependencyCheck[] = [
     command: "yt-dlp",
     ok: true,
     details: "Found in PATH.",
-    // Only a fallback since playback resolves through @kongyo2/niconicojs,
-    // but still auto-installed when absent.
     required: false,
     autoInstall: true,
   },

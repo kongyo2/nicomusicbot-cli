@@ -27,8 +27,6 @@ describe("bot-service exports", () => {
         expect.objectContaining({
           command: "yt-dlp",
           ok: true,
-          // Playback resolves through @kongyo2/niconicojs, so yt-dlp is only a
-          // fallback and must not block startup.
           required: false,
           autoInstall: true,
         }),
@@ -84,9 +82,6 @@ describe("bot-service exports", () => {
     });
   });
 
-  // Regression: spawn() reports a missing binary asynchronously, so the stdio
-  // streams look healthy and playback used to be announced for a track that
-  // then silently ended. Matters now that yt-dlp is optional.
   describe("waitForSpawn", () => {
     it("rejects when the binary is missing", async () => {
       const child = spawn("nicomusicbot-no-such-binary", ["--version"], {
@@ -94,7 +89,6 @@ describe("bot-service exports", () => {
       });
       child.on("error", () => undefined);
 
-      // The old guard checked this and would have let the track through.
       expect(child.stdout).not.toBeNull();
 
       await expect(waitForSpawn(child, "yt-dlp")).rejects.toThrow(
@@ -113,9 +107,6 @@ describe("bot-service exports", () => {
     });
   });
 
-  // Regression: ffmpeg and yt-dlp are spawned with a piped stderr that nothing
-  // read, so a chatty failure could fill the pipe buffer and block the child,
-  // and a nonzero exit had no diagnostic attached.
   describe("drainStderr", () => {
     it("captures a child's stderr so the pipe cannot fill up", async () => {
       const child = spawn(
@@ -138,8 +129,6 @@ describe("bot-service exports", () => {
         process.execPath,
         [
           "-e",
-          // Far more than the retained tail, and far more than a pipe buffer
-          // holds — this would block a child whose stderr nobody drained.
           "for (let i = 0; i < 20000; i++) process.stderr.write(`line ${i}\\n`);",
         ],
         { stdio: ["ignore", "pipe", "pipe"] },

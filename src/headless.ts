@@ -1,5 +1,7 @@
 import {
   NicomusicBotService,
+  describeMissingDependencies,
+  findMissingInstallable,
   autoSetupPrerequisites as defaultAutoSetupPrerequisites,
   checkPrerequisites as defaultCheckPrerequisites,
 } from "./bot-service.js";
@@ -61,6 +63,11 @@ function formatLog(entry: LogEntry): string {
   return `[${entry.level}] ${entry.message}`;
 }
 
+function reportFailure(store: RuntimeStore, message: string): void {
+  store.setStatus("error", message);
+  store.addLog("error", message);
+}
+
 function attachLogSink(
   store: RuntimeStore,
   stdout: NodeJS.WriteStream,
@@ -108,13 +115,7 @@ async function resolveDependencyChecks(
     checks: DependencyCheck[],
   ) => Promise<DependencySetupResult>,
 ): Promise<DependencyCheck[]> {
-  // Install anything installable that is missing, not just the blockers:
-  // yt-dlp is optional now but still worth having as a fallback.
-  const missingInstallable = checks.filter(
-    (check) => check.autoInstall === true && !check.ok,
-  );
-
-  if (missingInstallable.length === 0) {
+  if (findMissingInstallable(checks).length === 0) {
     return checks;
   }
 
@@ -183,15 +184,10 @@ export async function runHeadless(
     );
     store.setDependencies(checks);
 
-    const missing = checks.filter((check) => check.required && !check.ok);
+    const missingMessage = describeMissingDependencies(checks);
 
-    if (missing.length > 0) {
-      const message = `Missing dependencies: ${missing
-        .map((check) => check.command)
-        .join(", ")}`;
-
-      store.setStatus("error", message);
-      store.addLog("error", message);
+    if (missingMessage) {
+      reportFailure(store, missingMessage);
       return 1;
     }
 
@@ -206,10 +202,7 @@ export async function runHeadless(
     await waitForShutdown({ service, store, config });
     return 0;
   } catch (error) {
-    const message = normalizeErrorMessage(error);
-
-    store.setStatus("error", message);
-    store.addLog("error", message);
+    reportFailure(store, normalizeErrorMessage(error));
     await service?.stop().catch(() => undefined);
     return 1;
   } finally {
