@@ -173,11 +173,12 @@ describe("niconico helpers", () => {
     );
   });
 
-  it("prefers cookie auth over username/password", () => {
+  it("hands yt-dlp the session cookie file, never the retired password login", () => {
     expect(authArgs({})).toEqual([]);
+    // yt-dlp's password login answers 404 and aborts the whole extraction.
     expect(
       authArgs({ niconicoUser: "user@example.test", niconicoPassword: "pw" }),
-    ).toEqual(["--username", "user@example.test", "--password", "pw"]);
+    ).toEqual([]);
     expect(
       authArgs({
         niconicoUser: "user@example.test",

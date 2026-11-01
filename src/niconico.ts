@@ -132,21 +132,14 @@ export function buildNiconicoCookieFile(session: string): string | undefined {
   ].join("\n");
 }
 
+/**
+ * yt-dlp signs in with the session cookie file only. Its username/password
+ * login posts to account.nicovideo.jp/login/redirector, which NicoNico has
+ * retired (it answers 404), and a failed login aborts the whole extraction:
+ * passing credentials would break the fallback even for public videos.
+ */
 export function authArgs(auth: NicoAuth): string[] {
-  if (auth.cookiesPath) {
-    return ["--cookies", auth.cookiesPath];
-  }
-
-  if (auth.niconicoUser && auth.niconicoPassword) {
-    return [
-      "--username",
-      auth.niconicoUser,
-      "--password",
-      auth.niconicoPassword,
-    ];
-  }
-
-  return [];
+  return auth.cookiesPath ? ["--cookies", auth.cookiesPath] : [];
 }
 
 async function runCommand(

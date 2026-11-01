@@ -713,7 +713,8 @@ const SETUP_FIELDS: Record<FieldStage, SetupField> = {
   },
   niconicoUser: {
     title: "NicoNico username or email",
-    describe: () => "Leave empty to run without NicoNico account credentials.",
+    describe: () =>
+      "Ignored: NicoNico retired the password login. Leave empty and paste the session cookie in the next step instead.",
     secret: false,
     placeholder: () => "Optional",
     defaultValue: (draft) => draft.niconicoUser,
@@ -742,7 +743,7 @@ const SETUP_FIELDS: Record<FieldStage, SetupField> = {
     describe: (draft) =>
       draft.niconicoPassword
         ? "Press Enter to keep the current password."
-        : "Required only when using a NicoNico account.",
+        : "Ignored: NicoNico retired the password login.",
     secret: true,
     placeholder: (draft) =>
       draft.niconicoPassword
@@ -761,8 +762,8 @@ const SETUP_FIELDS: Record<FieldStage, SetupField> = {
     describe: (draft) => (
       <>
         Paste the `user_session` cookie value from a logged-in browser. This is
-        the most reliable login (it survives 2FA) and helps avoid mid-playback
-        stops on restricted videos.
+        the only way to log in (it also works with 2FA) and helps avoid
+        mid-playback stops on restricted videos.
         {draft.niconicoSession
           ? ' Press Enter to keep it, or type "-" to remove it.'
           : " Leave empty to skip."}
@@ -1115,7 +1116,7 @@ function ConfigSummary({ draft }: { draft: ConfigDraft }) {
           {draft.niconicoSession
             ? "session cookie"
             : draft.niconicoUser
-              ? `${draft.niconicoUser} + password`
+              ? `${draft.niconicoUser} + password (ignored)`
               : "disabled"}
         </Text>
       </UnorderedList.Item>

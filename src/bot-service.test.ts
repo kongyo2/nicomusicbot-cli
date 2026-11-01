@@ -150,7 +150,7 @@ describe("bot-service exports", () => {
     });
   });
 
-  it("builds NicoNico auth args only when both credentials are configured", () => {
+  it("never hands yt-dlp the retired username/password login", () => {
     const store = new RuntimeStore("!", "/tmp/config.json");
 
     expect(new NicomusicBotService(config(), store).authArgs()).toEqual([]);
@@ -162,7 +162,7 @@ describe("bot-service exports", () => {
         }),
         store,
       ).authArgs(),
-    ).toEqual(["--username", "user@example.test", "--password", "password"]);
+    ).toEqual([]);
   });
 
   describe("prepareNiconicoSession", () => {
@@ -222,6 +222,35 @@ describe("bot-service exports", () => {
         level: "warn",
         message: expect.stringContaining("not a user_session cookie"),
       });
+    });
+
+    it("warns that a configured username and password are ignored", async () => {
+      const fetchMock = vi.fn<typeof fetch>();
+      vi.stubGlobal("fetch", fetchMock);
+      const store = new RuntimeStore("!", "/tmp/config.json");
+      const service = new NicomusicBotService(
+        config({
+          niconicoUser: "user@example.test",
+          niconicoPassword: "password",
+        }),
+        store,
+      );
+
+      await service.prepareNiconicoSession();
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(service.authArgs()).toEqual([]);
+      expect(
+        store
+          .getState()
+          .logs.some(
+            (entry) =>
+              entry.level === "warn" &&
+              entry.message.includes(
+                "NicoNico username/password login no longer works",
+              ),
+          ),
+      ).toBe(true);
     });
 
     it("keeps a verified session and hands yt-dlp a cookie file", async () => {

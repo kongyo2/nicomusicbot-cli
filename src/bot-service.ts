@@ -1191,6 +1191,13 @@ export class NicomusicBotService {
    * yt-dlp cookie file for a session that is kept.
    */
   async prepareNiconicoSession(): Promise<void> {
+    if (this.config.niconicoUser || this.config.niconicoPassword) {
+      this.log(
+        "warn",
+        "NicoNico username/password login no longer works (NicoNico retired the login form it used), so those settings are ignored. Set the user_session cookie (--niconico-session or NICONICO_SESSION) to log in.",
+      );
+    }
+
     await this.verifySession();
     await this.ensureCookieFile();
   }
