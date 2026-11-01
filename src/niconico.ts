@@ -57,24 +57,16 @@ class YtDlpCommandError extends Error {
 /**
  * NicoNico itself will not play the video for this viewer — it was deleted,
  * does not exist, or needs a purchase or membership. yt-dlp talks to the same
- * service, so falling back to it only helps when it watches as someone else
- * (see {@link ytDlpMayPlayRefusedVideo}).
+ * service, so falling back to it cannot help.
  */
 export class NiconicoUnplayableError extends Error {
-  /**
-   * The refusal depends on who is watching (a purchase, a channel
-   * membership), not on the video itself as a deletion or a missing ID does.
-   */
-  readonly accountDependent: boolean;
-
   constructor(
     readonly videoId: string,
     readonly reason: string,
-    options: ErrorOptions & { accountDependent?: boolean } = {},
+    options?: ErrorOptions,
   ) {
     super(`NicoNico refused to stream ${videoId}: ${reason}`, options);
     this.name = "NiconicoUnplayableError";
-    this.accountDependent = options.accountDependent ?? false;
   }
 }
 
@@ -155,20 +147,6 @@ export function authArgs(auth: NicoAuth): string[] {
   }
 
   return [];
-}
-
-/**
- * Whether yt-dlp might play a video NicoNico refused the native client. A
- * deletion or a missing ID is final. A purchase or membership requirement
- * depends on the viewer, and yt-dlp is a different viewer only when it signs
- * in with a username and password: with the session cookie, or as a guest,
- * it is refused exactly like the native client was.
- */
-export function ytDlpMayPlayRefusedVideo(
-  error: NiconicoUnplayableError,
-  auth: NicoAuth,
-): boolean {
-  return error.accountDependent && authArgs(auth)[0] === "--username";
 }
 
 async function runCommand(
@@ -891,8 +869,7 @@ export type NativeAudioStream = {
   recordView: () => Promise<void>;
 };
 
-/** Refusals that hold for every viewer: the video is gone or never existed. */
-const FINAL_REFUSALS: Record<string, string> = {
+const REFUSAL_REASONS: Record<string, string> = {
   ADMINISTRATOR_DELETE_VIDEO:
     "the video was deleted by the NicoNico administrators",
   RIGHT_HOLDER_DELETE_VIDEO:
@@ -902,39 +879,22 @@ const FINAL_REFUSALS: Record<string, string> = {
 };
 
 /**
- * Turns a watch API refusal that names its reason (a 403/404 carrying a
- * reasonCode, or a bare 404) into a NiconicoUnplayableError. Transient and
- * account-level failures without a reason stay as they are.
+ * Explains why the watch API refused a video, when the refusal is about the
+ * video itself (deleted, missing) rather than a transient or account problem.
  */
-function toUnplayableError(
-  videoId: string,
-  error: unknown,
-): NiconicoUnplayableError | undefined {
-  if (
-    !isNiconicoApiError(error) ||
-    (error.status !== 403 && error.status !== 404)
-  ) {
+function describeRefusal(error: unknown): string | undefined {
+  if (!isNiconicoApiError(error)) {
     return undefined;
   }
 
-  const reasonCode =
-    error.reasonCode ?? (error.status === 404 ? "NOT_FOUND" : undefined);
-
-  if (reasonCode === undefined) {
-    return undefined;
+  if (error.reasonCode && (error.status === 403 || error.status === 404)) {
+    return (
+      REFUSAL_REASONS[error.reasonCode] ??
+      `NicoNico refused the video (${error.reasonCode})`
+    );
   }
 
-  const final = FINAL_REFUSALS[reasonCode];
-
-  // An unfamiliar reason may well depend on the viewer, so it does not rule
-  // out a yt-dlp fallback that signs in as someone else.
-  return final
-    ? new NiconicoUnplayableError(videoId, final, { cause: error })
-    : new NiconicoUnplayableError(
-        videoId,
-        `NicoNico refused the video (${reasonCode})`,
-        { cause: error, accountDependent: true },
-      );
+  return error.status === 404 ? REFUSAL_REASONS.NOT_FOUND : undefined;
 }
 
 const WATCHABLE_USER_TYPES: Record<string, string> = {
@@ -986,7 +946,13 @@ async function fetchWatchData(
   try {
     return await requestWatchData(client, videoId);
   } catch (error) {
-    throw toUnplayableError(videoId, error) ?? error;
+    const refusal = describeRefusal(error);
+
+    if (refusal === undefined) {
+      throw error;
+    }
+
+    throw new NiconicoUnplayableError(videoId, refusal, { cause: error });
   }
 }
 
@@ -1014,7 +980,6 @@ export async function resolveNativeAudioStream(
     throw new NiconicoUnplayableError(
       resource.videoId,
       describeUnavailableMedia(watch.data),
-      { accountDependent: true },
     );
   }
 
@@ -1022,7 +987,6 @@ export async function resolveNativeAudioStream(
     throw new NiconicoUnplayableError(
       resource.videoId,
       "no access right key — the video may need a purchase or a channel membership",
-      { accountDependent: true },
     );
   }
 
@@ -1032,7 +996,6 @@ export async function resolveNativeAudioStream(
     throw new NiconicoUnplayableError(
       resource.videoId,
       "no available audio rendition",
-      { accountDependent: true },
     );
   }
 

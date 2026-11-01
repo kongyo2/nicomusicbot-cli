@@ -13,7 +13,6 @@ import {
   resetNiconicoClientCache,
   resolveNativeAudioStream,
   searchByTag,
-  ytDlpMayPlayRefusedVideo,
 } from "./niconico.js";
 
 // Unit tests never shell out: yt-dlp behaves as if it were not installed, so
@@ -892,27 +891,24 @@ describe("niconico helpers", () => {
         "FORBIDDEN",
         "ADMINISTRATOR_DELETE_VIDEO",
         /deleted by the NicoNico administrators/,
-        false,
       ],
       [
         403,
         "FORBIDDEN",
         "RIGHT_HOLDER_DELETE_VIDEO",
         /deleted at the rights holder's request/,
-        false,
       ],
-      [403, "FORBIDDEN", "DELETED_VIDEO", /has been deleted/, false],
-      [404, "NOT_FOUND", "NOT_FOUND", /no video exists with this ID/, false],
+      [403, "FORBIDDEN", "DELETED_VIDEO", /has been deleted/],
+      [404, "NOT_FOUND", "NOT_FOUND", /no video exists with this ID/],
       [
         403,
         "FORBIDDEN",
         "SOMETHING_NEW",
         /refused the video \(SOMETHING_NEW\)/,
-        true,
       ],
     ])(
       "explains a %i %s refusal with reasonCode %s",
-      async (status, errorCode, reasonCode, reason, accountDependent) => {
+      async (status, errorCode, reasonCode, reason) => {
         const fetchMock = vi
           .fn<typeof fetch>()
           .mockResolvedValue(apiError(status, errorCode, { reasonCode }));
@@ -924,7 +920,6 @@ describe("niconico helpers", () => {
         );
 
         expect(error).toBeInstanceOf(NiconicoUnplayableError);
-        expect(error).toMatchObject({ accountDependent });
         expect((error as NiconicoUnplayableError).reason).toMatch(reason);
         expect(fetchMock).toHaveBeenCalledTimes(1);
       },
@@ -975,7 +970,6 @@ describe("niconico helpers", () => {
         );
 
         expect(error).toBeInstanceOf(NiconicoUnplayableError);
-        expect(error).toMatchObject({ accountDependent: true });
         expect((error as NiconicoUnplayableError).reason).toMatch(reason);
       },
     );
@@ -987,47 +981,6 @@ describe("niconico helpers", () => {
           {},
         ),
       ).rejects.toThrow(/not a NicoNico video reference/);
-    });
-  });
-
-  describe("ytDlpMayPlayRefusedVideo", () => {
-    const membersOnly = new NiconicoUnplayableError(
-      "so123",
-      "only channel members can play this video",
-      { accountDependent: true },
-    );
-    const deleted = new NiconicoUnplayableError(
-      "sm1",
-      "the video was deleted by the NicoNico administrators",
-    );
-    const password = {
-      niconicoUser: "user@example.test",
-      niconicoPassword: "pw",
-    };
-
-    it("retries an account-dependent refusal when yt-dlp signs in with a password", () => {
-      expect(ytDlpMayPlayRefusedVideo(membersOnly, password)).toBe(true);
-    });
-
-    it("never retries a video that is gone for everyone", () => {
-      expect(ytDlpMayPlayRefusedVideo(deleted, password)).toBe(false);
-    });
-
-    it("skips yt-dlp when it would watch as the same viewer", () => {
-      // The session cookie file wins over the password, as in authArgs.
-      expect(
-        ytDlpMayPlayRefusedVideo(membersOnly, {
-          ...password,
-          niconicoSession: SESSION,
-          cookiesPath: "/tmp/cookies.txt",
-        }),
-      ).toBe(false);
-      expect(ytDlpMayPlayRefusedVideo(membersOnly, {})).toBe(false);
-      expect(
-        ytDlpMayPlayRefusedVideo(membersOnly, {
-          niconicoUser: "user@example.test",
-        }),
-      ).toBe(false);
     });
   });
 
