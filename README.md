@@ -8,7 +8,8 @@
 Discordのボイスチャンネルでニコニコ動画の音声を再生するためのbotです。
 
 音声の解決には [`@kongyo2/niconicojs`](https://www.npmjs.com/package/@kongyo2/niconicojs)
-を使用し、ニコニコの DMS (Domand) API から**音声のみの HLS ストリーム**を直接取得します。
+を使用し、現行の Web プレイヤーと同じ視聴 API（nvapi v4）とニコニコの DMS (Domand) API から
+**音声のみの HLS ストリーム**を直接取得します。
 映像を一切ダウンロードしないため転送量が小さく、再生が途中で切れにくくなっています。
 
 ## 必要条件
@@ -42,9 +43,9 @@ npx @kongyo2/nicomusicbot [options]
 
 - `--token <token>`: Discord botのトークン
 - `--prefix <prefix>`: コマンドのプレフィックス (デフォルト: `!`)
-- `--niconico-user <value>`: ニコニコ動画のログインユーザー名/メールアドレス
-- `--niconico-password <value>`: ニコニコ動画のログインパスワード
-- `--niconico-session <value>`: ニコニコ動画の `user_session` クッキー（**推奨**）
+- `--niconico-user <value>`: ニコニコ動画のログインユーザー名/メールアドレス（**現在は無視されます**。下記参照）
+- `--niconico-password <value>`: ニコニコ動画のログインパスワード（**現在は無視されます**。下記参照）
+- `--niconico-session <value>`: ニコニコ動画の `user_session` クッキー（ログインはこの方法のみ）
 - `--config <path>`: 設定ファイルのパスを指定
 - `--save-config`: セットアップ後に設定を保存する
 - `--no-save-config`: 設定を保存しない
@@ -63,21 +64,29 @@ npx @kongyo2/nicomusicbot --token "YOUR_DISCORD_TOKEN" --skip-menu
 
 `!play` には以下の形式を指定できます。いずれも外部コマンドなしで解決されます。
 
-| 形式             | 例                                                    |
-| :--------------- | :---------------------------------------------------- |
-| 動画ID           | `sm9`                                                 |
-| 視聴URL          | `https://www.nicovideo.jp/watch/sm9`                  |
-| 短縮URL          | `https://nico.ms/sm9`                                 |
-| スマホ版URL      | `https://sp.nicovideo.jp/watch/sm9`                   |
-| マイリスト       | `https://www.nicovideo.jp/mylist/79600395`            |
-| シリーズ         | `https://www.nicovideo.jp/series/176162`              |
-| ユーザー投稿動画 | `https://www.nicovideo.jp/user/9003560/video`         |
-| ランキング       | `https://www.nicovideo.jp/ranking/genre/all?term=24h` |
-| タグ             | `https://www.nicovideo.jp/tag/VOCALOID`               |
-| 検索             | `https://www.nicovideo.jp/search/初音ミク`            |
+| 形式                       | 例                                                    |
+| :------------------------- | :---------------------------------------------------- |
+| 動画ID                     | `sm9`、`ss46171060`（ショート動画）                   |
+| 視聴URL                    | `https://www.nicovideo.jp/watch/sm9`                  |
+| ショート動画URL            | `https://www.nicovideo.jp/shorts/ss46171060`          |
+| 短縮URL                    | `https://nico.ms/sm9`                                 |
+| スマホ版URL                | `https://sp.nicovideo.jp/watch/sm9`                   |
+| マイリスト                 | `https://www.nicovideo.jp/mylist/79600395`            |
+| シリーズ                   | `https://www.nicovideo.jp/series/176162`              |
+| ユーザー投稿動画           | `https://www.nicovideo.jp/user/9003560/video`         |
+| ランキング                 | `https://www.nicovideo.jp/ranking/genre/all?term=24h` |
+| タグ                       | `https://www.nicovideo.jp/tag/VOCALOID`               |
+| 検索                       | `https://www.nicovideo.jp/search/初音ミク`            |
+| あとで見る（要セッション） | `https://www.nicovideo.jp/my/watchlater`              |
 
 Discordがリンクを `<...>` で囲んだ場合も、そのまま解釈します。
 上記以外のURLは yt-dlp にフォールバックします。
+
+非公開マイリスト（`https://www.nicovideo.jp/my/mylist/...` など）と「あとで見る」は、
+セッションクッキーを設定したアカウント自身のものを再生できます。
+
+削除された動画・存在しない動画・購入やチャンネル会員登録が必要な動画は、理由を表示してスキップします
+（yt-dlp でも再生できないため、フォールバックは行いません）。
 
 ## 環境変数
 
@@ -85,27 +94,34 @@ Discordがリンクを `<...>` で囲んだ場合も、そのまま解釈しま�
 
 - `DISCORD_TOKEN`: Discord botのトークン
 - `NICOMUSICBOT_PREFIX`: コマンドのプレフィックス
-- `NICONICO_USER`: ニコニコ動画のログインユーザー名/メールアドレス
-- `NICONICO_PASSWORD` または `NICONICO_PASS`: ニコニコ動画のログインパスワード
-- `NICONICO_SESSION`: ニコニコ動画の `user_session` クッキー（推奨。下記参照）
+- `NICONICO_USER`: ニコニコ動画のログインユーザー名/メールアドレス（現在は無視されます）
+- `NICONICO_PASSWORD` または `NICONICO_PASS`: ニコニコ動画のログインパスワード（現在は無視されます）
+- `NICONICO_SESSION`: ニコニコ動画の `user_session` クッキー（下記参照）
 
-## ニコニコのログインについて（推奨: セッションクッキー）
+## ニコニコのログインについて（セッションクッキー）
 
-ニコニコのユーザー名/パスワードによるログインは、2段階認証やログインフローの仕様変更により
-失敗することがあります。より確実なのは、ログイン済みブラウザの `user_session` クッキーを使う方法です。
+ニコニコへのログインには、ログイン済みブラウザの `user_session` クッキーを使います。
 
 1. ブラウザでニコニコ動画にログインする
 2. 開発者ツール → Application/Storage → Cookies から `user_session` の値をコピーする
    （`user_session_XXXXXXXX_...` の形式）
 3. `--niconico-session "<値>"` または環境変数 `NICONICO_SESSION` に設定する
 
-セッションクッキーを設定すると、ユーザー名/パスワードより優先して使用されます。
 ログイン済みセッションを使うことで、視聴制限のある動画でも途中で止まりにくくなります。
 
 値は生のクッキー値・`user_session=...`・`Cookie: user_session=...` のいずれの形式でも
 受け付けます。起動時にセッションの有効性を確認し、ログを表示します。
+期限切れ・ログアウト済みのセッションや `user_session` の形式でない値は使用せず、
+警告を表示したうえでゲストとして再生します。
 
 セッションを設定しない場合はゲストとして再生します（公開動画は再生可能です）。
+
+再生が始まると、ニコニコの Web プレイヤーと同じく視聴が記録されます
+（再生数に加え、セッションを設定している場合はそのアカウントの視聴履歴にも残ります）。
+
+ユーザー名/パスワードによるログインは、ニコニコ側のログイン方式の変更により使えなくなりました
+（yt-dlp が使っていたログイン先が廃止されて 404 を返し、公開動画の取得まで失敗するようになっていました）。
+そのため現在は無視され、設定されている場合は起動時に警告を表示します。
 
 ## 設定ファイルの保存場所
 

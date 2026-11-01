@@ -1,15 +1,18 @@
 import { spawn } from "node:child_process";
 import {
-  DomandUnavailableError,
+  NiconicoAuthError,
   NiconicoClient,
   RANKING_ALL_KEY,
   domandRequestHeaders,
+  extractUserSession,
   isNiconicoApiError,
   pickBestAudio,
   type EssentialVideo,
+  type MylistDetail,
   type RankingTerm,
   type VideoSearchParams,
-  type WatchResult,
+  type WatchV4Data,
+  type WatchV4Result,
 } from "@kongyo2/niconicojs";
 import { err, fromPromise, ok, type Result } from "neverthrow";
 import { normalizeError, normalizeErrorMessage } from "./errors.js";
@@ -34,6 +37,7 @@ const VIDEO_ID_PREFIXES = [
   "cw",
   "zb",
   "z9",
+  "ss",
 ] as const;
 
 const COLLECTION_LIMIT = 250;
@@ -50,12 +54,18 @@ class YtDlpCommandError extends Error {
   }
 }
 
+/**
+ * NicoNico itself will not play the video for this viewer — it was deleted,
+ * does not exist, or needs a purchase or membership. yt-dlp talks to the same
+ * service, so falling back to it cannot help.
+ */
 export class NiconicoUnplayableError extends Error {
   constructor(
     readonly videoId: string,
-    reason: string,
+    readonly reason: string,
+    options?: ErrorOptions,
   ) {
-    super(`NicoNico refused to stream ${videoId}: ${reason}`);
+    super(`NicoNico refused to stream ${videoId}: ${reason}`, options);
     this.name = "NiconicoUnplayableError";
   }
 }
@@ -90,23 +100,17 @@ export function getNiconicoClient(auth: NicoAuth): NiconicoClient {
   return client;
 }
 
+/**
+ * Extracts the `user_session` value from a raw value, a `user_session=…` pair,
+ * or a pasted Cookie header. Anything else is not a session cookie — the client
+ * library refuses to be constructed with it — so it is treated as absent.
+ */
 export function normalizeSessionValue(
   session: string | undefined,
 ): string | undefined {
-  let value = session?.trim();
+  const value = session?.trim();
 
-  if (!value) {
-    return undefined;
-  }
-
-  value = value.replace(/^cookie:\s*/i, "");
-  const sessionMatch = value.match(/user_session=([^;\s]+)/i);
-
-  if (sessionMatch) {
-    value = sessionMatch[1];
-  }
-
-  return value || undefined;
+  return value ? extractUserSession(value) : undefined;
 }
 
 export function buildNiconicoCookieFile(session: string): string | undefined {
@@ -128,21 +132,14 @@ export function buildNiconicoCookieFile(session: string): string | undefined {
   ].join("\n");
 }
 
+/**
+ * yt-dlp signs in with the session cookie file only. Its username/password
+ * login posts to account.nicovideo.jp/login/redirector, which NicoNico has
+ * retired (it answers 404), and a failed login aborts the whole extraction:
+ * passing credentials would break the fallback even for public videos.
+ */
 export function authArgs(auth: NicoAuth): string[] {
-  if (auth.cookiesPath) {
-    return ["--cookies", auth.cookiesPath];
-  }
-
-  if (auth.niconicoUser && auth.niconicoPassword) {
-    return [
-      "--username",
-      auth.niconicoUser,
-      "--password",
-      auth.niconicoPassword,
-    ];
-  }
-
-  return [];
+  return auth.cookiesPath ? ["--cookies", auth.cookiesPath] : [];
 }
 
 async function runCommand(
@@ -195,7 +192,22 @@ function stripWrappingBrackets(input: string): string {
   return input.trim().replace(/^<|>$/g, "");
 }
 
+/**
+ * Short videos live at `/shorts/ss…` on the site, a path yt-dlp does not
+ * recognize; `/watch/ss…` serves the same video and works everywhere.
+ */
+function rewriteShortsPath(url: string): string {
+  return url.replace(
+    /^(https?:\/\/www\.nicovideo\.jp)\/shorts\/(?=[a-z]{2}\d+(?:[/?#]|$))/i,
+    "$1/watch/",
+  );
+}
+
 export function normalizeNiconicoUrl(input: string): string {
+  return rewriteShortsPath(normalizeUrlShape(input));
+}
+
+function normalizeUrlShape(input: string): string {
   let url = stripWrappingBrackets(input);
 
   if (!url) {
@@ -254,6 +266,7 @@ export function makeTrackUrl(entry: TrackEntry): string | undefined {
 export type NiconicoResource =
   | { kind: "video"; videoId: string }
   | { kind: "mylist"; mylistId: string }
+  | { kind: "watch-later" }
   | { kind: "series"; seriesId: string }
   | { kind: "user"; userId: string }
   | { kind: "ranking"; featuredKey?: string; term?: RankingTerm; tag?: string }
@@ -307,6 +320,10 @@ export function classifyNiconicoUrl(input: string): NiconicoResource {
 
   if (watchIndex >= 0 && segments[watchIndex + 1]) {
     return { kind: "video", videoId: segments[watchIndex + 1].toLowerCase() };
+  }
+
+  if (segments[0] === "my" && segments[1] === "watchlater") {
+    return { kind: "watch-later" };
   }
 
   const mylistIndex = segments.indexOf("mylist");
@@ -467,6 +484,92 @@ async function collectEntries(
   return entriesFromVideos(collected, limit);
 }
 
+function mylistPage(detail: MylistDetail): {
+  items: EssentialVideo[];
+  hasNext: boolean;
+} {
+  return {
+    items: detail.items.map((item) => item.video),
+    hasNext: detail.hasNext,
+  };
+}
+
+async function collectMylistEntries(
+  client: NiconicoClient,
+  mylistId: string,
+  limit: number,
+  log?: NiconicoLogger,
+): Promise<TrackEntry[]> {
+  try {
+    return await collectEntries(limit, async (page) =>
+      mylistPage(
+        await client.mylists.getMylist(mylistId, { pageSize: PAGE_SIZE, page }),
+      ),
+    );
+  } catch (error) {
+    if (!isNiconicoApiError(error) || error.status !== 403) {
+      throw error;
+    }
+
+    if (!client.isLoggedIn()) {
+      throw new Error(
+        `Mylist ${mylistId} is private; only its owner's NicoNico session can play it.`,
+        { cause: error },
+      );
+    }
+
+    // The public route refuses a private mylist even to its owner; the
+    // session owner's own route serves it.
+    log?.(
+      "info",
+      `Mylist ${mylistId} is private; reading it through the session owner's mylists.`,
+    );
+
+    try {
+      return await collectEntries(limit, async (page) =>
+        mylistPage(
+          await client.mylists.getMyMylist(mylistId, {
+            pageSize: PAGE_SIZE,
+            page,
+          }),
+        ),
+      );
+    } catch (ownerError) {
+      if (isNiconicoApiError(ownerError) && ownerError.status === 404) {
+        throw new Error(
+          `Mylist ${mylistId} is private and does not belong to the account of the configured NicoNico session.`,
+          { cause: ownerError },
+        );
+      }
+
+      throw ownerError;
+    }
+  }
+}
+
+async function collectWatchLaterEntries(
+  client: NiconicoClient,
+  limit: number,
+): Promise<TrackEntry[]> {
+  if (!client.isLoggedIn()) {
+    throw new Error(
+      "The watch-later list (あとで見る) belongs to an account; configure a NicoNico session cookie to play it.",
+    );
+  }
+
+  return collectEntries(limit, async (page) => {
+    const result = await client.mylists.getMyWatchLater({
+      pageSize: PAGE_SIZE,
+      page,
+    });
+
+    return {
+      items: result.items.map((item) => item.video),
+      hasNext: result.hasNext,
+    };
+  });
+}
+
 async function searchEntries(
   client: NiconicoClient,
   limit: number,
@@ -500,17 +603,10 @@ async function resolveResourceEntries(
     }
 
     case "mylist":
-      return collectEntries(limit, async (page) => {
-        const detail = await client.mylists.getMylist(resource.mylistId, {
-          pageSize: PAGE_SIZE,
-          page,
-        });
+      return collectMylistEntries(client, resource.mylistId, limit, log);
 
-        return {
-          items: detail.items.map((item) => item.video),
-          hasNext: detail.hasNext,
-        };
-      });
+    case "watch-later":
+      return collectWatchLaterEntries(client, limit);
 
     case "series":
       return collectEntries(limit, async (page) => {
@@ -756,27 +852,100 @@ export type NativeAudioStream = {
   audioStreamId: string;
   audioBitRate: number;
   expireTime?: string;
+  /** NicoNico served the video to a guest, not to the session's account. */
+  guest: boolean;
+  /**
+   * Records the view (view count, and the watch history when logged in) the
+   * way the web player does once playback starts. Watch v4 has no implicit
+   * side effects, so nothing is recorded unless this is called.
+   */
+  recordView: () => Promise<void>;
 };
+
+const REFUSAL_REASONS: Record<string, string> = {
+  ADMINISTRATOR_DELETE_VIDEO:
+    "the video was deleted by the NicoNico administrators",
+  RIGHT_HOLDER_DELETE_VIDEO:
+    "the video was deleted at the rights holder's request",
+  DELETED_VIDEO: "the video has been deleted",
+  NOT_FOUND: "no video exists with this ID",
+};
+
+/**
+ * Explains why the watch API refused a video, when the refusal is about the
+ * video itself (deleted, missing) rather than a transient or account problem.
+ */
+function describeRefusal(error: unknown): string | undefined {
+  if (!isNiconicoApiError(error)) {
+    return undefined;
+  }
+
+  if (error.reasonCode && (error.status === 403 || error.status === 404)) {
+    return (
+      REFUSAL_REASONS[error.reasonCode] ??
+      `NicoNico refused the video (${error.reasonCode})`
+    );
+  }
+
+  return error.status === 404 ? REFUSAL_REASONS.NOT_FOUND : undefined;
+}
+
+const WATCHABLE_USER_TYPES: Record<string, string> = {
+  member: "only channel members can play this video",
+  purchaser: "this video has to be purchased before it can be played",
+  premium: "only premium members can play this video",
+};
+
+function describeUnavailableMedia(data: WatchV4Data): string {
+  const userType = data.payment?.watchableUserType;
+  const known = userType ? WATCHABLE_USER_TYPES[userType] : undefined;
+
+  if (known) {
+    return known;
+  }
+
+  return `no playable stream (okReason=${data.okReason}${userType ? `, watchableUserType=${userType}` : ""})`;
+}
+
+function isSessionRejection(error: unknown): boolean {
+  return (
+    isNiconicoApiError(error) &&
+    (error.isUnauthorized() || error.errorCode === "UNAUTHORIZED")
+  );
+}
+
+async function requestWatchData(
+  client: NiconicoClient,
+  videoId: string,
+): Promise<WatchV4Result> {
+  try {
+    return await client.watch.getWatchV4(videoId);
+  } catch (error) {
+    if (!client.isLoggedIn() || !isSessionRejection(error)) {
+      throw error;
+    }
+
+    // A rejected cookie: watch as a guest. Guest data has to be followed up
+    // without the cookie (a guest key sent with one is a 400), and the result
+    // carries `guest: true` so the access-rights call knows to drop it.
+    return client.watch.getWatchV4(videoId, { asGuest: true });
+  }
+}
 
 async function fetchWatchData(
   client: NiconicoClient,
   videoId: string,
-): Promise<WatchResult> {
-  if (!client.isLoggedIn()) {
-    return client.watch.getGuestWatchData(videoId);
-  }
-
+): Promise<WatchV4Result> {
   try {
-    return await client.watch.getWatchData(videoId);
+    return await requestWatchData(client, videoId);
   } catch (error) {
-    if (
-      isNiconicoApiError(error) &&
-      (error.isUnauthorized() || error.status === 403)
-    ) {
-      return client.watch.getGuestWatchData(videoId);
+    const refusal = describeRefusal(error);
+
+    if (refusal === undefined) {
+      throw error;
     }
 
-    throw error;
+    throw new NiconicoUnplayableError(videoId, refusal, { cause: error });
   }
 }
 
@@ -798,23 +967,23 @@ export async function resolveNativeAudioStream(
 
   const client = getNiconicoClient(auth);
   const watch = await fetchWatchData(client, resource.videoId);
-  const domand = watch.data.media?.domand;
+  const { media, video } = watch.data;
 
-  if (!domand) {
+  if (!media) {
     throw new NiconicoUnplayableError(
       resource.videoId,
-      `no DMS stream (okReason=${watch.data.okReason})`,
+      describeUnavailableMedia(watch.data),
     );
   }
 
-  if (!domand.accessRightKey) {
+  if (!media.accessRightKey) {
     throw new NiconicoUnplayableError(
       resource.videoId,
-      "no access right key — the video may need a paid or channel membership",
+      "no access right key — the video may need a purchase or a channel membership",
     );
   }
 
-  const audio = pickBestAudio(domand);
+  const audio = pickBestAudio(media.contents);
 
   if (!audio) {
     throw new NiconicoUnplayableError(
@@ -823,31 +992,28 @@ export async function resolveNativeAudioStream(
     );
   }
 
-  try {
-    const hls = await client.streaming.createHlsAccessRights({
-      videoId: watch.data.video.id,
-      accessRightKey: domand.accessRightKey,
-      actionTrackId: watch.actionTrackId,
-      audioStreamId: audio.id,
-    });
+  // An audio-only session: its playlist lists just this rendition, so ffmpeg
+  // never downloads video segments (the pre-issued v4 session lists them all).
+  const hls = await client.streaming.createHlsAccessRights({
+    videoId: video.id,
+    accessRightKey: media.accessRightKey,
+    actionTrackId: watch.actionTrackId,
+    audioStreamId: audio.id,
+    anonymous: watch.guest,
+  });
 
-    return {
-      videoId: watch.data.video.id,
-      title: watch.data.video.title,
-      durationSeconds: watch.data.video.duration,
-      contentUrl: hls.contentUrl,
-      headers: domandRequestHeaders(hls),
-      audioStreamId: audio.id,
-      audioBitRate: audio.bitRate,
-      ...(hls.expireTime ? { expireTime: hls.expireTime } : {}),
-    };
-  } catch (error) {
-    if (error instanceof DomandUnavailableError) {
-      throw new NiconicoUnplayableError(resource.videoId, error.message);
-    }
-
-    throw error;
-  }
+  return {
+    videoId: video.id,
+    title: video.title,
+    durationSeconds: video.duration,
+    contentUrl: hls.contentUrl,
+    headers: domandRequestHeaders(hls),
+    audioStreamId: audio.id,
+    audioBitRate: audio.bitRate,
+    ...(hls.expireTime ? { expireTime: hls.expireTime } : {}),
+    guest: watch.guest || watch.data.viewer === null,
+    recordView: () => client.watch.recordView(watch),
+  };
 }
 
 export async function resolveTrackTitle(
@@ -968,16 +1134,45 @@ export async function searchByTag(
   });
 }
 
-export async function verifyNiconicoSession(
-  auth: NicoAuth,
-): Promise<{ nickname: string; isPremium: boolean } | undefined> {
-  const client = getNiconicoClient(auth);
+export type NiconicoSessionCheck =
+  | { status: "none" }
+  | { status: "malformed" }
+  | { status: "rejected"; reason: string }
+  | { status: "verified"; nickname: string; isPremium: boolean };
 
-  if (!client.isLoggedIn()) {
-    return undefined;
+/**
+ * Checks a configured session cookie. "malformed" and "rejected" mean the
+ * value can never authenticate; a transport failure throws instead, since the
+ * cookie may well be fine.
+ */
+export async function checkNiconicoSession(
+  session: string | undefined,
+): Promise<NiconicoSessionCheck> {
+  if (!session?.trim()) {
+    return { status: "none" };
   }
 
-  const user = await client.auth.verifySession();
+  const value = normalizeSessionValue(session);
 
-  return { nickname: user.nickname, isPremium: user.isPremium };
+  if (!value) {
+    return { status: "malformed" };
+  }
+
+  try {
+    const user = await getNiconicoClient({
+      niconicoSession: value,
+    }).auth.verifySession();
+
+    return {
+      status: "verified",
+      nickname: user.nickname,
+      isPremium: user.isPremium,
+    };
+  } catch (error) {
+    if (error instanceof NiconicoAuthError) {
+      return { status: "rejected", reason: error.message };
+    }
+
+    throw error;
+  }
 }

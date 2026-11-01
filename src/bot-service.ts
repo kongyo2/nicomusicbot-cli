@@ -31,8 +31,10 @@ import type { ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { normalizeErrorMessage } from "./errors.js";
 import {
+  NiconicoUnplayableError,
   authArgs as buildAuthArgs,
   buildNiconicoCookieFile,
+  checkNiconicoSession,
   fetchEntries,
   makeTrackUrl,
   normalizeNiconicoUrl,
@@ -40,9 +42,9 @@ import {
   resolveNativeAudioStream,
   resolveTrackTitle,
   searchByTag,
-  verifyNiconicoSession,
   type NativeAudioStream,
   type NicoAuth,
+  type NiconicoSessionCheck,
 } from "./niconico.js";
 import { sleep } from "./retry.js";
 import { RuntimeStore } from "./runtime-store.js";
@@ -817,6 +819,17 @@ class GuildController {
 
       const { stream: native, error: nativeError } =
         await this.resolveNativeStream(next);
+
+      if (nativeError instanceof NiconicoUnplayableError) {
+        this.lastError = nativeError.message;
+        this.playbackStatus = "error";
+        this.updateSnapshot();
+        await this.notify(
+          `Skipped ${next.title ?? next.id ?? "Unknown"}: ${nativeError.reason}.`,
+        );
+        continue;
+      }
+
       let ytDlpStderr: (() => string) | undefined;
 
       try {
@@ -912,6 +925,14 @@ class GuildController {
         });
 
         resource.volume?.setVolume(this.volume);
+
+        if (native) {
+          // The first decoded audio is where the web player records the view.
+          ffmpeg.stdout.once("data", () => {
+            void this.recordView(native, title);
+          });
+        }
+
         this.current = {
           ...next,
           title,
@@ -993,17 +1014,33 @@ class GuildController {
 
       this.service.log(
         "info",
-        `[${this.guild.name}] Resolved "${stream.title}" via NicoNico DMS (${Math.round(stream.audioBitRate / 1000)} kbps audio-only).`,
+        `[${this.guild.name}] Resolved "${stream.title}" via NicoNico DMS (${Math.round(stream.audioBitRate / 1000)} kbps audio-only${stream.guest ? ", as a guest" : ""}).`,
       );
 
       return { stream };
     } catch (error) {
       this.service.log(
         "warn",
-        `[${this.guild.name}] Native stream resolution failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
+        error instanceof NiconicoUnplayableError
+          ? `[${this.guild.name}] ${error.message}; skipping the track.`
+          : `[${this.guild.name}] Native stream resolution failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
       );
 
       return { error };
+    }
+  }
+
+  private async recordView(
+    stream: NativeAudioStream,
+    title: string,
+  ): Promise<void> {
+    try {
+      await stream.recordView();
+    } catch (error) {
+      this.service.log(
+        "warn",
+        `[${this.guild.name}] Could not record the NicoNico view of "${title}": ${normalizeErrorMessage(error)}`,
+      );
     }
   }
 
@@ -1091,6 +1128,7 @@ export class NicomusicBotService {
   private readonly guildControllers = new Map<string, GuildController>();
   private cookiesPath?: string;
   private cookiesDir?: string;
+  private sessionUnusable = false;
 
   constructor(config: BotConfig, store: RuntimeStore) {
     this.config = config;
@@ -1101,11 +1139,16 @@ export class NicomusicBotService {
     this.store.addLog(level, message);
   }
 
+  /** The configured session, unless it turned out to be malformed or rejected. */
+  private activeSession(): string | undefined {
+    return this.sessionUnusable ? undefined : this.config.niconicoSession;
+  }
+
   niconicoAuth(): NicoAuth {
     return {
       niconicoUser: this.config.niconicoUser,
       niconicoPassword: this.config.niconicoPassword,
-      niconicoSession: this.config.niconicoSession,
+      niconicoSession: this.activeSession(),
       cookiesPath: this.cookiesPath,
     };
   }
@@ -1115,11 +1158,13 @@ export class NicomusicBotService {
   }
 
   private async ensureCookieFile(): Promise<void> {
-    if (this.cookiesPath || !this.config.niconicoSession) {
+    const session = this.activeSession();
+
+    if (this.cookiesPath || !session) {
       return;
     }
 
-    const contents = buildNiconicoCookieFile(this.config.niconicoSession);
+    const contents = buildNiconicoCookieFile(session);
 
     if (!contents) {
       return;
@@ -1140,34 +1185,68 @@ export class NicomusicBotService {
     }
   }
 
-  private async verifySession(): Promise<void> {
-    if (!this.config.niconicoSession) {
+  /**
+   * Verifies the configured session cookie — dropping it when it can never
+   * authenticate, so playback really does run as a guest — and writes the
+   * yt-dlp cookie file for a session that is kept.
+   */
+  async prepareNiconicoSession(): Promise<void> {
+    if (this.config.niconicoUser || this.config.niconicoPassword) {
       this.log(
-        "info",
-        "No NicoNico session configured; playback runs as a guest.",
+        "warn",
+        "NicoNico username/password login no longer works (NicoNico retired the login form it used), so those settings are ignored. Set the user_session cookie (--niconico-session or NICONICO_SESSION) to log in.",
+      );
+    }
+
+    await this.verifySession();
+    await this.ensureCookieFile();
+  }
+
+  private async verifySession(): Promise<void> {
+    this.sessionUnusable = false;
+
+    let check: NiconicoSessionCheck;
+
+    try {
+      check = await checkNiconicoSession(this.config.niconicoSession);
+    } catch (error) {
+      this.log(
+        "warn",
+        `Could not verify the NicoNico session (${normalizeErrorMessage(error)}); using it anyway.`,
       );
       return;
     }
 
-    try {
-      const user = await verifyNiconicoSession(this.niconicoAuth());
+    switch (check.status) {
+      case "none":
+        this.log(
+          "info",
+          "No NicoNico session configured; playback runs as a guest.",
+        );
+        return;
 
-      if (user) {
+      case "verified":
         this.log(
           "success",
-          `NicoNico session verified as ${user.nickname}${user.isPremium ? " (premium)" : ""}.`,
+          `NicoNico session verified as ${check.nickname}${check.isPremium ? " (premium)" : ""}.`,
         );
-      } else {
+        return;
+
+      case "malformed":
+        this.sessionUnusable = true;
         this.log(
           "warn",
-          "The configured NicoNico session could not be used; playback runs as a guest.",
+          "The configured NicoNico session is not a user_session cookie (expected user_session_...); playback runs as a guest.",
         );
-      }
-    } catch (error) {
-      this.log(
-        "warn",
-        `NicoNico session check failed (${normalizeErrorMessage(error)}); continuing as a guest.`,
-      );
+        return;
+
+      case "rejected":
+        this.sessionUnusable = true;
+        this.log(
+          "warn",
+          `NicoNico no longer accepts the configured session cookie (expired or logged out); playback runs as a guest. ${check.reason}`,
+        );
+        return;
     }
   }
 
@@ -1194,8 +1273,7 @@ export class NicomusicBotService {
       value: 60,
     });
     this.log("info", "Preparing Discord client...");
-    await this.ensureCookieFile();
-    await this.verifySession();
+    await this.prepareNiconicoSession();
     await this.waitForDiscordApi();
 
     const client = new Client({

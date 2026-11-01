@@ -62,7 +62,9 @@ describe("config", () => {
 
   it("keeps the legacy config path for the default profile", () => {
     const configHome = path.join(os.tmpdir(), "nicomusicbot-config-home");
+    // The config root is APPDATA on Windows and XDG_CONFIG_HOME elsewhere.
     vi.stubEnv("XDG_CONFIG_HOME", configHome);
+    vi.stubEnv("APPDATA", configHome);
 
     const options = parseCliOptions([]);
 
@@ -74,7 +76,9 @@ describe("config", () => {
 
   it("resolves named profiles under the profiles directory", () => {
     const configHome = path.join(os.tmpdir(), "nicomusicbot-config-home");
+    // The config root is APPDATA on Windows and XDG_CONFIG_HOME elsewhere.
     vi.stubEnv("XDG_CONFIG_HOME", configHome);
+    vi.stubEnv("APPDATA", configHome);
 
     const options = parseCliOptions(["--profile", "work"]);
 
