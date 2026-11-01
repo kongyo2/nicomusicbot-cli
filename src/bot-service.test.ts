@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { rm } from "node:fs/promises";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NicomusicBotService,
   autoSetupPrerequisites,
@@ -7,8 +9,11 @@ import {
   drainStderr,
   waitForSpawn,
 } from "./bot-service.js";
+import { resetNiconicoClientCache } from "./niconico.js";
 import { RuntimeStore } from "./runtime-store.js";
 import type { BotConfig, DependencyCheck } from "./types.js";
+
+const SESSION = "user_session_1_0123456789abcdef";
 
 function config(overrides: Partial<BotConfig> = {}): BotConfig {
   return {
@@ -158,5 +163,106 @@ describe("bot-service exports", () => {
         store,
       ).authArgs(),
     ).toEqual(["--username", "user@example.test", "--password", "password"]);
+  });
+
+  describe("prepareNiconicoSession", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      resetNiconicoClientCache();
+    });
+
+    function lastLog(store: RuntimeStore) {
+      return store.getState().logs.at(-1);
+    }
+
+    it("drops a rejected session so playback really runs as a guest", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(
+            Response.json(
+              { meta: { status: 401, errorCode: "UNAUTHORIZED" } },
+              { status: 401 },
+            ),
+          ),
+      );
+      const store = new RuntimeStore("!", "/tmp/config.json");
+      const service = new NicomusicBotService(
+        config({ niconicoSession: SESSION }),
+        store,
+      );
+
+      await service.prepareNiconicoSession();
+
+      expect(service.niconicoAuth().niconicoSession).toBeUndefined();
+      expect(service.authArgs()).toEqual([]);
+      expect(lastLog(store)).toMatchObject({
+        level: "warn",
+        message: expect.stringContaining(
+          "no longer accepts the configured session cookie",
+        ),
+      });
+    });
+
+    it("drops a value that is not a user_session cookie without asking NicoNico", async () => {
+      const fetchMock = vi.fn<typeof fetch>();
+      vi.stubGlobal("fetch", fetchMock);
+      const store = new RuntimeStore("!", "/tmp/config.json");
+      const service = new NicomusicBotService(
+        config({ niconicoSession: "not-a-session" }),
+        store,
+      );
+
+      await service.prepareNiconicoSession();
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(service.niconicoAuth().niconicoSession).toBeUndefined();
+      expect(lastLog(store)).toMatchObject({
+        level: "warn",
+        message: expect.stringContaining("not a user_session cookie"),
+      });
+    });
+
+    it("keeps a verified session and hands yt-dlp a cookie file", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn<typeof fetch>().mockResolvedValue(
+          Response.json({
+            meta: { status: 200 },
+            data: {
+              userId: "1",
+              nickname: "tester",
+              hasPremiumOrStrongerRights: false,
+              icons: { urls: { "150x150": "https://example.test/icon.jpg" } },
+            },
+          }),
+        ),
+      );
+      const store = new RuntimeStore("!", "/tmp/config.json");
+      const service = new NicomusicBotService(
+        config({ niconicoSession: SESSION }),
+        store,
+      );
+
+      await service.prepareNiconicoSession();
+      const args = service.authArgs();
+
+      try {
+        expect(service.niconicoAuth().niconicoSession).toBe(SESSION);
+        expect(args[0]).toBe("--cookies");
+        expect(
+          store
+            .getState()
+            .logs.some((entry) =>
+              entry.message.includes("NicoNico session verified as tester"),
+            ),
+        ).toBe(true);
+      } finally {
+        if (args[1]) {
+          await rm(path.dirname(args[1]), { recursive: true, force: true });
+        }
+      }
+    });
   });
 });
