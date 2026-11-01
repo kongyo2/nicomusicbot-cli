@@ -54,11 +54,6 @@ class YtDlpCommandError extends Error {
   }
 }
 
-/**
- * NicoNico itself will not play the video for this viewer — it was deleted,
- * does not exist, or needs a purchase or membership. yt-dlp talks to the same
- * service, so falling back to it cannot help.
- */
 export class NiconicoUnplayableError extends Error {
   constructor(
     readonly videoId: string,
@@ -100,11 +95,6 @@ export function getNiconicoClient(auth: NicoAuth): NiconicoClient {
   return client;
 }
 
-/**
- * Extracts the `user_session` value from a raw value, a `user_session=…` pair,
- * or a pasted Cookie header. Anything else is not a session cookie — the client
- * library refuses to be constructed with it — so it is treated as absent.
- */
 export function normalizeSessionValue(
   session: string | undefined,
 ): string | undefined {
@@ -132,12 +122,6 @@ export function buildNiconicoCookieFile(session: string): string | undefined {
   ].join("\n");
 }
 
-/**
- * yt-dlp signs in with the session cookie file only. Its username/password
- * login posts to account.nicovideo.jp/login/redirector, which NicoNico has
- * retired (it answers 404), and a failed login aborts the whole extraction:
- * passing credentials would break the fallback even for public videos.
- */
 export function authArgs(auth: NicoAuth): string[] {
   return auth.cookiesPath ? ["--cookies", auth.cookiesPath] : [];
 }
@@ -192,10 +176,6 @@ function stripWrappingBrackets(input: string): string {
   return input.trim().replace(/^<|>$/g, "");
 }
 
-/**
- * Short videos live at `/shorts/ss…` on the site, a path yt-dlp does not
- * recognize; `/watch/ss…` serves the same video and works everywhere.
- */
 function rewriteShortsPath(url: string): string {
   return url.replace(
     /^(https?:\/\/www\.nicovideo\.jp)\/shorts\/(?=[a-z]{2}\d+(?:[/?#]|$))/i,
@@ -518,8 +498,6 @@ async function collectMylistEntries(
       );
     }
 
-    // The public route refuses a private mylist even to its owner; the
-    // session owner's own route serves it.
     log?.(
       "info",
       `Mylist ${mylistId} is private; reading it through the session owner's mylists.`,
@@ -852,13 +830,7 @@ export type NativeAudioStream = {
   audioStreamId: string;
   audioBitRate: number;
   expireTime?: string;
-  /** NicoNico served the video to a guest, not to the session's account. */
   guest: boolean;
-  /**
-   * Records the view (view count, and the watch history when logged in) the
-   * way the web player does once playback starts. Watch v4 has no implicit
-   * side effects, so nothing is recorded unless this is called.
-   */
   recordView: () => Promise<void>;
 };
 
@@ -871,10 +843,6 @@ const REFUSAL_REASONS: Record<string, string> = {
   NOT_FOUND: "no video exists with this ID",
 };
 
-/**
- * Explains why the watch API refused a video, when the refusal is about the
- * video itself (deleted, missing) rather than a transient or account problem.
- */
 function describeRefusal(error: unknown): string | undefined {
   if (!isNiconicoApiError(error)) {
     return undefined;
@@ -925,9 +893,6 @@ async function requestWatchData(
       throw error;
     }
 
-    // A rejected cookie: watch as a guest. Guest data has to be followed up
-    // without the cookie (a guest key sent with one is a 400), and the result
-    // carries `guest: true` so the access-rights call knows to drop it.
     return client.watch.getWatchV4(videoId, { asGuest: true });
   }
 }
@@ -992,8 +957,6 @@ export async function resolveNativeAudioStream(
     );
   }
 
-  // An audio-only session: its playlist lists just this rendition, so ffmpeg
-  // never downloads video segments (the pre-issued v4 session lists them all).
   const hls = await client.streaming.createHlsAccessRights({
     videoId: video.id,
     accessRightKey: media.accessRightKey,
@@ -1140,11 +1103,6 @@ export type NiconicoSessionCheck =
   | { status: "rejected"; reason: string }
   | { status: "verified"; nickname: string; isPremium: boolean };
 
-/**
- * Checks a configured session cookie. "malformed" and "rejected" mean the
- * value can never authenticate; a transport failure throws instead, since the
- * cookie may well be fine.
- */
 export async function checkNiconicoSession(
   session: string | undefined,
 ): Promise<NiconicoSessionCheck> {

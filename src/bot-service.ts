@@ -927,7 +927,6 @@ class GuildController {
         resource.volume?.setVolume(this.volume);
 
         if (native) {
-          // The first decoded audio is where the web player records the view.
           ffmpeg.stdout.once("data", () => {
             void this.recordView(native, title);
           });
@@ -1139,7 +1138,6 @@ export class NicomusicBotService {
     this.store.addLog(level, message);
   }
 
-  /** The configured session, unless it turned out to be malformed or rejected. */
   private activeSession(): string | undefined {
     return this.sessionUnusable ? undefined : this.config.niconicoSession;
   }
@@ -1185,11 +1183,6 @@ export class NicomusicBotService {
     }
   }
 
-  /**
-   * Verifies the configured session cookie — dropping it when it can never
-   * authenticate, so playback really does run as a guest — and writes the
-   * yt-dlp cookie file for a session that is kept.
-   */
   async prepareNiconicoSession(): Promise<void> {
     if (this.config.niconicoUser || this.config.niconicoPassword) {
       this.log(

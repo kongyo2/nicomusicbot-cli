@@ -15,8 +15,6 @@ import {
   searchByTag,
 } from "./niconico.js";
 
-// Unit tests never shell out: yt-dlp behaves as if it were not installed, so
-// the fallback fails fast and the same way on every machine.
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   const { EventEmitter } = await import("node:events");
@@ -175,7 +173,6 @@ describe("niconico helpers", () => {
 
   it("hands yt-dlp the session cookie file, never the retired password login", () => {
     expect(authArgs({})).toEqual([]);
-    // yt-dlp's password login answers 404 and aborts the whole extraction.
     expect(
       authArgs({ niconicoUser: "user@example.test", niconicoPassword: "pw" }),
     ).toEqual([]);
@@ -787,7 +784,6 @@ describe("niconico helpers", () => {
       expect(requestBody(rightsCall)).toEqual({
         outputs: [["audio-aac-128kbps"]],
       });
-      // The access right key is bound to the watch call's actionTrackId.
       expect(
         new URL(requestUrl(rightsCall)).searchParams.get("actionTrackId"),
       ).toBe(requestBody(watchCall).actionTrackId);
@@ -835,7 +831,6 @@ describe("niconico helpers", () => {
       expect(stream.guest).toBe(true);
       expect(requestBody(guestWatchCall)).toMatchObject({ asGuest: true });
       expect(requestHeaders(guestWatchCall).has("cookie")).toBe(false);
-      // A guest access key presented with a session cookie is a 400.
       expect(requestHeaders(rightsCall).has("cookie")).toBe(false);
     });
 
