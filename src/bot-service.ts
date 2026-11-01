@@ -42,6 +42,7 @@ import {
   resolveNativeAudioStream,
   resolveTrackTitle,
   searchByTag,
+  ytDlpMayPlayRefusedVideo,
   type NativeAudioStream,
   type NicoAuth,
   type NiconicoSessionCheck,
@@ -820,7 +821,7 @@ class GuildController {
       const { stream: native, error: nativeError } =
         await this.resolveNativeStream(next);
 
-      if (nativeError instanceof NiconicoUnplayableError) {
+      if (this.isFinalRefusal(nativeError)) {
         this.lastError = nativeError.message;
         this.playbackStatus = "error";
         this.updateSnapshot();
@@ -1021,13 +1022,24 @@ class GuildController {
     } catch (error) {
       this.service.log(
         "warn",
-        error instanceof NiconicoUnplayableError
+        this.isFinalRefusal(error)
           ? `[${this.guild.name}] ${error.message}; skipping the track.`
           : `[${this.guild.name}] Native stream resolution failed (${normalizeErrorMessage(error)}); falling back to yt-dlp.`,
       );
 
       return { error };
     }
+  }
+
+  /**
+   * NicoNico refused the video in a way yt-dlp cannot get around: it watches
+   * as the same viewer, or the video is gone for everyone.
+   */
+  private isFinalRefusal(error: unknown): error is NiconicoUnplayableError {
+    return (
+      error instanceof NiconicoUnplayableError &&
+      !ytDlpMayPlayRefusedVideo(error, this.service.niconicoAuth())
+    );
   }
 
   private async recordView(
